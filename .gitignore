@@ -1,0 +1,10 @@
+.DS_Store
+
+# Build artifacts
+simagent
+*.exe
+*.out
+*.test
+
+# Go workspace artifacts
+coverage.out
