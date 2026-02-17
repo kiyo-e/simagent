@@ -13,11 +13,11 @@ It is designed for fast `frame -> action -> frame` loops during live debugging s
 - `frame` command that generates:
   - raw screenshot
   - raw UI tree
-  - normalized interactive elements with stable indexes
+  - normalized elements with stable indexes (`label/value/visible/offscreen/nearbyLabel` included)
   - transform metadata (`pt <-> px`)
   - annotated screenshot with index overlays
-- UI actions by coordinates, index, or element ID:
-  - tap / type / swipe / button
+- UI actions by coordinates, index, element ID, or text:
+  - tap / type / swipe / wait / button
 - App helper actions:
   - openurl / launch / terminate / list
 - Machine-readable JSON output (`--json`)
@@ -74,10 +74,16 @@ git push origin v0.1.0
 3. Type into a target field:
 
 ```bash
-./simagent ui type "hello@example.com" --into --index 2 --json
+./simagent ui type --text "hello@example.com" --into --index 2 --verify --json
 ```
 
-4. Re-capture frame:
+4. Wait for a UI transition:
+
+```bash
+./simagent ui wait --has-text "確認" --interactive-min 1 --timeout 15s --json
+```
+
+5. Re-capture frame:
 
 ```bash
 ./simagent frame --json
@@ -96,7 +102,7 @@ Top-level commands:
 
 - `target` (`list`, `set`, `show`)
 - `frame`
-- `ui` (`tap`, `type`, `swipe`, `button`)
+- `ui` (`tap`, `type`, `swipe`, `wait`, `button`)
 - `app` (`openurl`, `launch`, `terminate`, `list`)
 - `raw` (`simctl`, `idb`)
 
@@ -119,6 +125,33 @@ Generated files:
 - `elements.json`
 - `transform.json`
 - `annotated.png`
+
+`elements.json` includes stable identifiers and automation hints:
+
+- `index`, `id`, `role`, `label`, `value`
+- `enabled`, `visible`, `offscreen`
+- `nearbyLabel`, `frame`, `center`, `source`
+
+## UI Command Notes
+
+`ui type` now supports `--text` as the primary input. Positional text is still accepted for compatibility.
+
+```bash
+./simagent ui type --text "170" --into --label "身長" --verify --json
+```
+
+`ui tap` supports text-based selectors and falls back to system-UI heuristics for common top-bar actions (for example add/cancel style buttons):
+
+```bash
+./simagent ui tap --label "次へ" --json
+./simagent ui tap --contains "スキップ" --json
+```
+
+`ui wait` polls `idb ui describe-all --json` until a condition is satisfied:
+
+```bash
+./simagent ui wait --has-text "送信完了" --interactive-min 1 --timeout 20s --interval 700ms --json
+```
 
 ## JSON Error Shape
 

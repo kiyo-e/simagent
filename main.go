@@ -108,15 +108,19 @@ type ElementSource struct {
 }
 
 type Element struct {
-	Index   int           `json:"index"`
-	ID      string        `json:"id"`
-	Role    string        `json:"role,omitempty"`
-	Label   string        `json:"label,omitempty"`
-	Enabled bool          `json:"enabled"`
-	Frame   FrameRect     `json:"frame"`
-	Center  FramePoint    `json:"center"`
-	Source  ElementSource `json:"source"`
-	order   int
+	Index       int           `json:"index"`
+	ID          string        `json:"id"`
+	Role        string        `json:"role,omitempty"`
+	Label       string        `json:"label,omitempty"`
+	Value       string        `json:"value,omitempty"`
+	NearbyLabel string        `json:"nearbyLabel,omitempty"`
+	Enabled     bool          `json:"enabled"`
+	Visible     bool          `json:"visible"`
+	Offscreen   bool          `json:"offscreen"`
+	Frame       FrameRect     `json:"frame"`
+	Center      FramePoint    `json:"center"`
+	Source      ElementSource `json:"source"`
+	order       int
 }
 
 type Transform struct {
@@ -172,6 +176,10 @@ type frameOptions struct {
 
 var interactiveRoleHints = []string{
 	"button", "textfield", "securetextfield", "switch", "slider", "cell", "link",
+}
+
+var textInputRoleHints = []string{
+	"textfield", "securetextfield", "searchfield", "textarea", "textview",
 }
 
 func main() {
@@ -505,7 +513,7 @@ func (a *App) cmdFrame(args []string) (bool, error) {
 
 func (a *App) cmdUI(args []string) (bool, error) {
 	if len(args) == 0 {
-		return a.opts.JSON, &AppError{Code: "USAGE", Message: "ui subcommand required: tap|type|swipe|button"}
+		return a.opts.JSON, &AppError{Code: "USAGE", Message: "ui subcommand required: tap|type|swipe|wait|button"}
 	}
 	sub := args[0]
 	args = args[1:]
@@ -527,31 +535,82 @@ func (a *App) cmdUI(args []string) (bool, error) {
 		unit := fs.String("unit", "pt", "pt|px")
 		index := fs.Int("index", -1, "element index")
 		id := fs.String("id", "", "element id")
+		label := fs.String("label", "", "tap by exact label")
+		contains := fs.String("contains", "", "tap by partial label/value")
 		from := fs.String("from", "", "path to elements.json")
 		localJSON := fs.Bool("json", false, "")
 		if err := fs.Parse(args); err != nil {
 			return emitJSON, &AppError{Code: "USAGE", Message: err.Error()}
 		}
 		emitJSON = emitJSON || *localJSON
+		if *unit != "pt" && *unit != "px" {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--unit must be pt|px"}
+		}
+
+		selectorCount := 0
+		if *index >= 0 {
+			selectorCount++
+		}
+		if strings.TrimSpace(*id) != "" {
+			selectorCount++
+		}
+		if strings.TrimSpace(*label) != "" {
+			selectorCount++
+		}
+		if strings.TrimSpace(*contains) != "" {
+			selectorCount++
+		}
+		if selectorCount > 1 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "choose only one selector: --index|--id|--label|--contains"}
+		}
 
 		var x float64
 		var y float64
 		by := "coord"
+		fallbackUsed := false
 		usedIndex := -1
 		usedID := ""
+		usedLabel := strings.TrimSpace(*label)
+		usedContains := strings.TrimSpace(*contains)
 
-		if *index >= 0 || *id != "" {
-			elements, transform, err := loadElementsAndTransform(*from)
-			if err != nil {
-				return emitJSON, err
+		if selectorCount > 0 {
+			elements := []Element{}
+			if strings.TrimSpace(*from) != "" || *index >= 0 || strings.TrimSpace(*id) != "" {
+				loadedElements, _, loadErr := loadElementsAndTransform(*from)
+				if loadErr != nil {
+					return emitJSON, loadErr
+				}
+				elements = loadedElements
+			} else if loadedElements, _, loadErr := loadElementsAndTransform(*from); loadErr == nil {
+				elements = loadedElements
 			}
-			_ = transform
-			elem, err := pickElement(elements, *index, *id)
+			elem, err := pickElementBySelectors(elements, *index, *id, usedLabel, usedContains)
 			if err != nil {
-				return emitJSON, err
+				snapshot, snapErr := a.captureElements(target.UDID)
+				if snapErr == nil {
+					elem, err = pickElementBySelectors(snapshot.Elements, *index, *id, usedLabel, usedContains)
+					if err == nil {
+						by = "live-scan"
+					}
+					if err != nil && (usedLabel != "" || usedContains != "") {
+						if fallback, ok := pickSystemFallbackElement(snapshot.Elements, usedLabel, usedContains); ok {
+							elem = fallback
+							err = nil
+							by = "system-fallback"
+							fallbackUsed = true
+						}
+					}
+				}
+				if err != nil {
+					return emitJSON, err
+				}
 			}
-			x = elem.Center.X
-			y = elem.Center.Y
+			tapPoint := elem.Center
+			if isTextInputRole(elem.Role) {
+				tapPoint = focusPointForElement(elem)
+			}
+			x = tapPoint.X
+			y = tapPoint.Y
 			if *index >= 0 {
 				by = "index"
 				usedIndex = *index
@@ -560,10 +619,16 @@ func (a *App) cmdUI(args []string) (bool, error) {
 				by = "id"
 				usedID = *id
 			}
+			if usedLabel != "" && !fallbackUsed {
+				by = "label"
+			}
+			if usedContains != "" && !fallbackUsed {
+				by = "contains"
+			}
 		} else {
 			vals := fs.Args()
 			if len(vals) != 2 {
-				return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui tap <x> <y> [--unit pt|px]"}
+				return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui tap <x> <y> [--unit pt|px] | --index <n> | --id <id> | --label <text> | --contains <text>"}
 			}
 			var errX error
 			var errY error
@@ -597,6 +662,15 @@ func (a *App) cmdUI(args []string) (bool, error) {
 		if usedID != "" {
 			resp["id"] = usedID
 		}
+		if usedLabel != "" {
+			resp["label"] = usedLabel
+		}
+		if usedContains != "" {
+			resp["contains"] = usedContains
+		}
+		if fallbackUsed {
+			resp["fallback"] = "system-ui"
+		}
 		if emitJSON {
 			a.printJSON(resp)
 		} else {
@@ -605,34 +679,54 @@ func (a *App) cmdUI(args []string) (bool, error) {
 		return emitJSON, nil
 
 	case "type":
-		fs := flag.NewFlagSet("ui type", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		into := fs.Bool("into", false, "tap target before typing")
-		index := fs.Int("index", -1, "element index")
-		id := fs.String("id", "", "element id")
-		from := fs.String("from", "", "path to elements.json")
-		localJSON := fs.Bool("json", false, "")
-		if err := fs.Parse(args); err != nil {
-			return emitJSON, &AppError{Code: "USAGE", Message: err.Error()}
+		opts, err := parseUITypeArgs(args)
+		if err != nil {
+			return emitJSON, err
 		}
-		emitJSON = emitJSON || *localJSON
-		text := strings.Join(fs.Args(), " ")
+		emitJSON = emitJSON || opts.JSON
+		text := strings.TrimSpace(opts.Text)
 		if text == "" {
-			return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui type \"text\" [--into --index <n>|--id <id>]"}
+			return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui type --text \"...\" [--into --index <n>|--id <id>|--label <text>|--contains <text>] [--verify]"}
 		}
 
-		if *into {
-			elements, _, err := loadElementsAndTransform(*from)
-			if err != nil {
-				return emitJSON, err
+		selectorCount := countElementSelectors(opts.Index, opts.ID, opts.Label, opts.Contains)
+		if opts.Into && selectorCount != 1 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--into requires exactly one selector: --index|--id|--label|--contains"}
+		}
+		if !opts.Into && selectorCount > 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "selector flags require --into"}
+		}
+
+		var focused *Element
+		if opts.Into {
+			elements := []Element{}
+			if strings.TrimSpace(opts.From) != "" || opts.Index >= 0 || strings.TrimSpace(opts.ID) != "" {
+				loadedElements, _, loadErr := loadElementsAndTransform(opts.From)
+				if loadErr != nil {
+					return emitJSON, loadErr
+				}
+				elements = loadedElements
+			} else if loadedElements, _, loadErr := loadElementsAndTransform(opts.From); loadErr == nil {
+				elements = loadedElements
 			}
-			elem, err := pickElement(elements, *index, *id)
+			elem, err := pickElementBySelectors(elements, opts.Index, opts.ID, opts.Label, opts.Contains)
 			if err != nil {
-				return emitJSON, err
+				snapshot, snapErr := a.captureElements(target.UDID)
+				if snapErr != nil {
+					return emitJSON, err
+				}
+				elem, err = pickElementBySelectors(snapshot.Elements, opts.Index, opts.ID, opts.Label, opts.Contains)
+				if err != nil {
+					return emitJSON, err
+				}
 			}
-			if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(elem.Center.X), idbCoordArg(elem.Center.Y)); err != nil {
+			focusPoint := focusPointForElement(elem)
+			if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(focusPoint.X), idbCoordArg(focusPoint.Y)); err != nil {
 				return emitJSON, wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed")
 			}
+			copyElem := elem
+			copyElem.Center = focusPoint
+			focused = &copyElem
 		}
 
 		if _, err := a.runIDB(target.UDID, "ui", "text", text); err != nil {
@@ -640,12 +734,104 @@ func (a *App) cmdUI(args []string) (bool, error) {
 		}
 
 		resp := map[string]any{"ok": true, "action": "type", "text": text}
+		if opts.Verify {
+			verify, err := a.verifyTypeResult(target.UDID, text, focused)
+			if err != nil {
+				return emitJSON, err
+			}
+			resp["verified"] = true
+			resp["verify"] = verify
+		}
 		if emitJSON {
 			a.printJSON(resp)
 		} else {
 			fmt.Printf("typed: %s\n", text)
 		}
 		return emitJSON, nil
+
+	case "wait":
+		fs := flag.NewFlagSet("ui wait", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		hasText := fs.String("has-text", "", "substring to wait for (label/value)")
+		interactiveMin := fs.Int("interactive-min", -1, "minimum interactive count")
+		timeout := fs.Duration("timeout", 20*time.Second, "maximum wait duration")
+		interval := fs.Duration("interval", 700*time.Millisecond, "poll interval")
+		localJSON := fs.Bool("json", false, "")
+		if err := fs.Parse(args); err != nil {
+			return emitJSON, &AppError{Code: "USAGE", Message: err.Error()}
+		}
+		emitJSON = emitJSON || *localJSON
+		if fs.NArg() != 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "ui wait does not accept positional args"}
+		}
+		if strings.TrimSpace(*hasText) == "" && *interactiveMin < 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "ui wait requires --has-text and/or --interactive-min"}
+		}
+		if *timeout <= 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--timeout must be > 0"}
+		}
+		if *interval <= 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--interval must be > 0"}
+		}
+
+		started := time.Now()
+		attempts := 0
+		lastInteractive := 0
+		lastMatches := []string{}
+		var lastErr error
+		targetText := strings.ToLower(strings.TrimSpace(*hasText))
+
+		for {
+			attempts++
+			snapshot, snapErr := a.captureElements(target.UDID)
+			if snapErr != nil {
+				lastErr = snapErr
+			} else {
+				lastErr = nil
+				lastInteractive = snapshot.InteractiveCount
+				textMatches := matchingTextSamples(snapshot.Elements, targetText)
+				lastMatches = textMatches
+				interactiveOK := *interactiveMin < 0 || snapshot.InteractiveCount >= *interactiveMin
+				textOK := targetText == "" || len(textMatches) > 0
+				if interactiveOK && textOK {
+					resp := map[string]any{
+						"ok":          true,
+						"action":      "wait",
+						"attempts":    attempts,
+						"elapsedMs":   time.Since(started).Milliseconds(),
+						"interactive": snapshot.InteractiveCount,
+					}
+					if targetText != "" {
+						resp["hasText"] = *hasText
+						resp["matches"] = textMatches
+					}
+					if emitJSON {
+						a.printJSON(resp)
+					} else {
+						fmt.Printf("wait ok (%d attempts)\n", attempts)
+					}
+					return emitJSON, nil
+				}
+			}
+
+			if time.Since(started) >= *timeout {
+				details := map[string]any{
+					"attempts":       attempts,
+					"elapsedMs":      time.Since(started).Milliseconds(),
+					"interactive":    lastInteractive,
+					"interactiveMin": *interactiveMin,
+				}
+				if targetText != "" {
+					details["hasText"] = *hasText
+					details["lastMatches"] = lastMatches
+				}
+				if lastErr != nil {
+					details["lastError"] = renderError(lastErr)
+				}
+				return emitJSON, &AppError{Code: "WAIT_TIMEOUT", Message: "wait condition not met before timeout", Details: details}
+			}
+			time.Sleep(*interval)
+		}
 
 	case "swipe":
 		fs := flag.NewFlagSet("ui swipe", flag.ContinueOnError)
@@ -1035,6 +1221,11 @@ func normalizeElements(rawUI any, opts frameOptions) ([]Element, int, int) {
 		allCandidates = append(allCandidates, elem)
 	}
 
+	screenRect := inferScreenRect(rawUI, allCandidates)
+	for i := range allCandidates {
+		allCandidates[i].Visible, allCandidates[i].Offscreen = classifyVisibility(allCandidates[i].Frame, screenRect)
+	}
+
 	switch opts.Order {
 	case "reading":
 		sort.Slice(allCandidates, func(i, j int) bool {
@@ -1059,6 +1250,7 @@ func normalizeElements(rawUI any, opts frameOptions) ([]Element, int, int) {
 	for i := range allCandidates {
 		allCandidates[i].Index = i + 1
 	}
+	allCandidates = addNearbyLabels(allCandidates)
 
 	return allCandidates, allCount, interactiveCount
 }
@@ -1096,19 +1288,120 @@ func elementFromCandidate(node candidateNode) (Element, bool) {
 	if id == "" {
 		id = "axpath:" + node.Path
 	}
-	role := firstString(node.Map, []string{"role", "type", "elementType", "axRole", "roleDescription"})
-	label := firstString(node.Map, []string{"label", "name", "title", "value", "placeholder"})
+	role := firstString(node.Map, []string{
+		"role", "type", "elementType", "axRole", "roleDescription", "AXRole", "wdType",
+	})
+	label := firstString(node.Map, []string{
+		"label", "name", "title", "placeholder", "accessibilityLabel", "axLabel", "AXLabel", "wdLabel",
+	})
+	value := firstString(node.Map, []string{
+		"value", "text", "axValue", "AXValue", "displayValue", "wdValue", "selectedText",
+	})
+	if label == "" && value != "" {
+		label = value
+	}
 	enabled := firstBoolWithDefault(node.Map, []string{"enabled", "isEnabled"}, true)
 
 	return Element{
 		ID:      id,
 		Role:    role,
 		Label:   label,
+		Value:   value,
 		Enabled: enabled,
+		Visible: true,
 		Frame:   rect,
 		Center:  FramePoint{X: rect.X + rect.W/2, Y: rect.Y + rect.H/2, Unit: "pt"},
 		Source:  ElementSource{Tool: "idb", Method: "describe-all"},
 	}, true
+}
+
+func inferScreenRect(rawUI any, elements []Element) FrameRect {
+	if root, ok := rawUI.(map[string]any); ok {
+		if rect, ok := findRect(root); ok && rect.W > 0 && rect.H > 0 {
+			return rect
+		}
+	}
+	minX := math.MaxFloat64
+	minY := math.MaxFloat64
+	maxX := 0.0
+	maxY := 0.0
+	for _, e := range elements {
+		if e.Frame.W <= 0 || e.Frame.H <= 0 {
+			continue
+		}
+		if e.Frame.X < minX {
+			minX = e.Frame.X
+		}
+		if e.Frame.Y < minY {
+			minY = e.Frame.Y
+		}
+		if e.Frame.X+e.Frame.W > maxX {
+			maxX = e.Frame.X + e.Frame.W
+		}
+		if e.Frame.Y+e.Frame.H > maxY {
+			maxY = e.Frame.Y + e.Frame.H
+		}
+	}
+	if minX == math.MaxFloat64 || minY == math.MaxFloat64 || maxX <= minX || maxY <= minY {
+		return FrameRect{}
+	}
+	return FrameRect{X: minX, Y: minY, W: maxX - minX, H: maxY - minY, Unit: "pt"}
+}
+
+func classifyVisibility(rect FrameRect, screen FrameRect) (bool, bool) {
+	if rect.W <= 0 || rect.H <= 0 {
+		return false, true
+	}
+	if screen.W <= 0 || screen.H <= 0 {
+		return true, false
+	}
+	screenRight := screen.X + screen.W
+	screenBottom := screen.Y + screen.H
+	rectRight := rect.X + rect.W
+	rectBottom := rect.Y + rect.H
+
+	interLeft := math.Max(rect.X, screen.X)
+	interTop := math.Max(rect.Y, screen.Y)
+	interRight := math.Min(rectRight, screenRight)
+	interBottom := math.Min(rectBottom, screenBottom)
+	if interRight <= interLeft || interBottom <= interTop {
+		return false, true
+	}
+	offscreen := rect.X < screen.X || rect.Y < screen.Y || rectRight > screenRight || rectBottom > screenBottom
+	return true, offscreen
+}
+
+func addNearbyLabels(elements []Element) []Element {
+	for i := range elements {
+		if strings.TrimSpace(elements[i].Label) != "" {
+			continue
+		}
+		bestIdx := -1
+		bestScore := math.MaxFloat64
+		for j := range elements {
+			if i == j {
+				continue
+			}
+			label := strings.TrimSpace(elements[j].Label)
+			if label == "" || !elements[j].Visible {
+				continue
+			}
+			dx := elements[i].Center.X - elements[j].Center.X
+			dy := elements[i].Center.Y - elements[j].Center.Y
+			distance := math.Hypot(dx, dy)
+			if distance > 220 {
+				continue
+			}
+			if distance < bestScore {
+				bestScore = distance
+				bestIdx = j
+			}
+		}
+		if bestIdx >= 0 {
+			elements[i].NearbyLabel = elements[bestIdx].Label
+		}
+	}
+	return elements
 }
 
 func findRect(m map[string]any) (FrameRect, bool) {
@@ -1585,6 +1878,466 @@ func pickElement(elements []Element, index int, id string) (Element, error) {
 		return Element{}, &AppError{Code: "ELEMENT_NOT_FOUND", Message: "element id not found: " + id}
 	}
 	return Element{}, &AppError{Code: "USAGE", Message: "index or id is required"}
+}
+
+type uiTypeOptions struct {
+	Text              string
+	Into              bool
+	Index             int
+	ID                string
+	Label             string
+	Contains          string
+	From              string
+	Verify            bool
+	JSON              bool
+	LegacyTypeParsing bool
+}
+
+type elementSnapshot struct {
+	Elements         []Element
+	AllCount         int
+	InteractiveCount int
+}
+
+func countElementSelectors(index int, id, label, contains string) int {
+	count := 0
+	if index >= 0 {
+		count++
+	}
+	if strings.TrimSpace(id) != "" {
+		count++
+	}
+	if strings.TrimSpace(label) != "" {
+		count++
+	}
+	if strings.TrimSpace(contains) != "" {
+		count++
+	}
+	return count
+}
+
+func pickElementBySelectors(elements []Element, index int, id, label, contains string) (Element, error) {
+	label = strings.TrimSpace(label)
+	contains = strings.TrimSpace(contains)
+	id = strings.TrimSpace(id)
+	switch countElementSelectors(index, id, label, contains) {
+	case 0:
+		return Element{}, &AppError{Code: "USAGE", Message: "selector is required: --index|--id|--label|--contains"}
+	case 1:
+		if index >= 0 || id != "" {
+			return pickElement(elements, index, id)
+		}
+		return pickElementByText(elements, label, contains)
+	default:
+		return Element{}, &AppError{Code: "USAGE", Message: "choose only one selector: --index|--id|--label|--contains"}
+	}
+}
+
+func pickElementByText(elements []Element, exactLabel, partial string) (Element, error) {
+	exactLabel = strings.ToLower(strings.TrimSpace(exactLabel))
+	partial = strings.ToLower(strings.TrimSpace(partial))
+	type candidate struct {
+		Element Element
+		Score   int
+	}
+	candidates := make([]candidate, 0)
+	for _, elem := range elements {
+		if !elem.Enabled {
+			continue
+		}
+		score := 0
+		if exactLabel != "" {
+			exactHit := false
+			if strings.EqualFold(strings.TrimSpace(elem.Label), exactLabel) {
+				exactHit = true
+				score += 90
+			}
+			if strings.EqualFold(strings.TrimSpace(elem.Value), exactLabel) {
+				exactHit = true
+				score += 75
+			}
+			if strings.EqualFold(strings.TrimSpace(elem.NearbyLabel), exactLabel) {
+				exactHit = true
+				score += 55
+			}
+			if !exactHit {
+				continue
+			}
+		}
+		if partial != "" {
+			text := strings.ToLower(elementText(elem))
+			if !strings.Contains(text, partial) {
+				continue
+			}
+			score += 45
+		}
+		if elem.Visible {
+			score += 24
+		}
+		if !elem.Offscreen {
+			score += 10
+		}
+		if isInteractiveRole(elem.Role) {
+			score += 15
+		}
+		if strings.TrimSpace(elem.Label) != "" {
+			score += 8
+		}
+		candidates = append(candidates, candidate{Element: elem, Score: score})
+	}
+	if len(candidates) == 0 {
+		if exactLabel != "" {
+			return Element{}, &AppError{Code: "ELEMENT_NOT_FOUND", Message: "element label not found: " + exactLabel}
+		}
+		return Element{}, &AppError{Code: "ELEMENT_NOT_FOUND", Message: "element text not found: " + partial}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Score != candidates[j].Score {
+			return candidates[i].Score > candidates[j].Score
+		}
+		return candidates[i].Element.Index < candidates[j].Element.Index
+	})
+	return candidates[0].Element, nil
+}
+
+func pickSystemFallbackElement(elements []Element, label, contains string) (Element, bool) {
+	query := strings.ToLower(strings.TrimSpace(label))
+	if query == "" {
+		query = strings.ToLower(strings.TrimSpace(contains))
+	}
+	if query == "" {
+		return Element{}, false
+	}
+
+	rightIntent := containsAnyToken(query, []string{"add", "done", "ok", "allow", "choose", "select", "追加", "完了", "許可", "選択"})
+	leftIntent := containsAnyToken(query, []string{"cancel", "close", "back", "dismiss", "キャンセル", "閉じる", "戻る"})
+	if !rightIntent && !leftIntent {
+		return Element{}, false
+	}
+
+	best := Element{}
+	found := false
+	for _, elem := range elements {
+		if !elem.Enabled || !elem.Visible {
+			continue
+		}
+		if elem.Frame.Y > 180 {
+			continue
+		}
+		if !isInteractiveRole(elem.Role) && !strings.Contains(strings.ToLower(elem.Role), "navigation") {
+			continue
+		}
+		if !found {
+			best = elem
+			found = true
+			continue
+		}
+		if elem.Center.Y < best.Center.Y {
+			best = elem
+			continue
+		}
+		if math.Abs(elem.Center.Y-best.Center.Y) <= 20 {
+			if rightIntent && elem.Center.X > best.Center.X {
+				best = elem
+			}
+			if leftIntent && elem.Center.X < best.Center.X {
+				best = elem
+			}
+		}
+	}
+	return best, found
+}
+
+func containsAnyToken(s string, tokens []string) bool {
+	for _, token := range tokens {
+		if strings.Contains(s, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseUITypeArgs(args []string) (uiTypeOptions, error) {
+	opts := uiTypeOptions{Index: -1}
+	positionals := make([]string, 0)
+
+	nextValue := func(i *int, name string) (string, error) {
+		if *i+1 >= len(args) {
+			return "", &AppError{Code: "USAGE", Message: "flag needs an argument: " + name}
+		}
+		*i = *i + 1
+		return args[*i], nil
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--into":
+			opts.Into = true
+		case arg == "--verify":
+			opts.Verify = true
+		case arg == "--json":
+			opts.JSON = true
+		case arg == "--legacy-type-parsing":
+			opts.LegacyTypeParsing = true
+		case arg == "--index":
+			raw, err := nextValue(&i, "--index")
+			if err != nil {
+				return opts, err
+			}
+			parsed, convErr := strconv.Atoi(strings.TrimSpace(raw))
+			if convErr != nil {
+				return opts, &AppError{Code: "USAGE", Message: "--index must be an integer"}
+			}
+			opts.Index = parsed
+		case strings.HasPrefix(arg, "--index="):
+			raw := strings.TrimSpace(strings.TrimPrefix(arg, "--index="))
+			parsed, convErr := strconv.Atoi(raw)
+			if convErr != nil {
+				return opts, &AppError{Code: "USAGE", Message: "--index must be an integer"}
+			}
+			opts.Index = parsed
+		case arg == "--id":
+			raw, err := nextValue(&i, "--id")
+			if err != nil {
+				return opts, err
+			}
+			opts.ID = raw
+		case strings.HasPrefix(arg, "--id="):
+			opts.ID = strings.TrimPrefix(arg, "--id=")
+		case arg == "--label":
+			raw, err := nextValue(&i, "--label")
+			if err != nil {
+				return opts, err
+			}
+			opts.Label = raw
+		case strings.HasPrefix(arg, "--label="):
+			opts.Label = strings.TrimPrefix(arg, "--label=")
+		case arg == "--contains":
+			raw, err := nextValue(&i, "--contains")
+			if err != nil {
+				return opts, err
+			}
+			opts.Contains = raw
+		case strings.HasPrefix(arg, "--contains="):
+			opts.Contains = strings.TrimPrefix(arg, "--contains=")
+		case arg == "--from":
+			raw, err := nextValue(&i, "--from")
+			if err != nil {
+				return opts, err
+			}
+			opts.From = raw
+		case strings.HasPrefix(arg, "--from="):
+			opts.From = strings.TrimPrefix(arg, "--from=")
+		case arg == "--text":
+			raw, err := nextValue(&i, "--text")
+			if err != nil {
+				return opts, err
+			}
+			opts.Text = raw
+		case strings.HasPrefix(arg, "--text="):
+			opts.Text = strings.TrimPrefix(arg, "--text=")
+		case strings.HasPrefix(arg, "-"):
+			return opts, &AppError{Code: "USAGE", Message: "unknown flag for ui type: " + arg}
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+
+	opts.ID = strings.TrimSpace(opts.ID)
+	opts.Label = strings.TrimSpace(opts.Label)
+	opts.Contains = strings.TrimSpace(opts.Contains)
+	opts.Text = strings.TrimSpace(opts.Text)
+	if opts.Text != "" && len(positionals) > 0 {
+		return opts, &AppError{Code: "USAGE", Message: "use either --text or positional text, not both"}
+	}
+	if opts.Text == "" && len(positionals) > 0 {
+		opts.Text = strings.Join(positionals, " ")
+	}
+	return opts, nil
+}
+
+func focusPointForElement(elem Element) FramePoint {
+	if !isTextInputRole(elem.Role) {
+		return elem.Center
+	}
+	if elem.Frame.W <= 0 {
+		return elem.Center
+	}
+	inset := math.Max(8, math.Min(elem.Frame.W*0.2, 28))
+	x := elem.Frame.X + inset
+	maxX := elem.Frame.X + elem.Frame.W - 8
+	if x > maxX {
+		x = elem.Center.X
+	}
+	return FramePoint{X: x, Y: elem.Center.Y, Unit: "pt"}
+}
+
+func isTextInputRole(role string) bool {
+	r := strings.ToLower(strings.TrimSpace(role))
+	if r == "" {
+		return false
+	}
+	for _, hint := range textInputRoleHints {
+		if strings.Contains(r, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) captureElements(udid string) (elementSnapshot, error) {
+	cmd, err := a.runIDB(udid, "ui", "describe-all", "--json")
+	if err != nil {
+		return elementSnapshot{}, wrapAppErrCode(err, "IDB_UI_FAILED", "failed to capture ui tree")
+	}
+	parsed, parseErr := decodeJSONOrWrap(cmd.Stdout)
+	if parseErr != nil {
+		return elementSnapshot{}, wrapErr("IDB_UI_FAILED", "failed to parse ui tree json", parseErr)
+	}
+	opts := frameOptions{
+		Order:           "reading",
+		InteractiveOnly: false,
+		IncludeRoles:    map[string]bool{},
+		ExcludeRoles:    map[string]bool{},
+	}
+	elements, allCount, _ := normalizeElements(parsed, opts)
+	interactiveVisible := 0
+	for _, elem := range elements {
+		if elem.Enabled && elem.Visible && isInteractiveRole(elem.Role) {
+			interactiveVisible++
+		}
+	}
+	return elementSnapshot{
+		Elements:         elements,
+		AllCount:         allCount,
+		InteractiveCount: interactiveVisible,
+	}, nil
+}
+
+func (a *App) verifyTypeResult(udid, typedText string, focused *Element) (map[string]any, error) {
+	snapshot, err := a.captureElements(udid)
+	if err != nil {
+		return nil, err
+	}
+
+	var target *Element
+	if focused != nil {
+		if matched, ok := findBestVerificationTarget(snapshot.Elements, *focused); ok {
+			target = &matched
+		}
+	}
+
+	typedNorm := normalizeTextForMatch(typedText)
+	if target != nil {
+		if elementHasTypedText(*target, typedNorm) {
+			return map[string]any{
+				"elementId": target.ID,
+				"label":     target.Label,
+				"value":     target.Value,
+			}, nil
+		}
+		if isSecureTextInputRole(target.Role) && strings.TrimSpace(target.Value) != "" && strings.TrimSpace(target.Value) != strings.TrimSpace(focused.Value) {
+			return map[string]any{
+				"elementId": target.ID,
+				"label":     target.Label,
+				"value":     target.Value,
+			}, nil
+		}
+	}
+
+	for _, elem := range snapshot.Elements {
+		if elementHasTypedText(elem, typedNorm) {
+			return map[string]any{
+				"elementId": elem.ID,
+				"label":     elem.Label,
+				"value":     elem.Value,
+			}, nil
+		}
+	}
+
+	return nil, &AppError{
+		Code:    "TYPE_VERIFY_FAILED",
+		Message: "typed text could not be verified from latest ui tree",
+		Details: map[string]any{"typed": typedText, "interactive": snapshot.InteractiveCount},
+	}
+}
+
+func findBestVerificationTarget(elements []Element, focused Element) (Element, bool) {
+	if strings.TrimSpace(focused.ID) != "" {
+		for _, elem := range elements {
+			if elem.ID == focused.ID {
+				return elem, true
+			}
+		}
+	}
+	best := Element{}
+	found := false
+	bestScore := math.MaxFloat64
+	for _, elem := range elements {
+		if !isTextInputRole(elem.Role) {
+			continue
+		}
+		dx := elem.Center.X - focused.Center.X
+		dy := elem.Center.Y - focused.Center.Y
+		score := math.Hypot(dx, dy)
+		if score < bestScore {
+			bestScore = score
+			best = elem
+			found = true
+		}
+	}
+	return best, found
+}
+
+func matchingTextSamples(elements []Element, needle string) []string {
+	if needle == "" {
+		return nil
+	}
+	out := make([]string, 0, 3)
+	for _, elem := range elements {
+		if !elem.Enabled {
+			continue
+		}
+		if strings.Contains(strings.ToLower(elementText(elem)), needle) {
+			out = append(out, strings.TrimSpace(fmt.Sprintf("%s %s", elem.Label, elem.Value)))
+			if len(out) >= 3 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func elementText(elem Element) string {
+	parts := []string{
+		strings.TrimSpace(elem.Label),
+		strings.TrimSpace(elem.Value),
+		strings.TrimSpace(elem.NearbyLabel),
+		strings.TrimSpace(elem.Role),
+	}
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func normalizeTextForMatch(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(s)), ""))
+}
+
+func elementHasTypedText(elem Element, typedNorm string) bool {
+	if typedNorm == "" {
+		return false
+	}
+	candidates := []string{elem.Value, elem.Label}
+	for _, c := range candidates {
+		if strings.Contains(normalizeTextForMatch(c), typedNorm) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSecureTextInputRole(role string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(role)), "securetextfield")
 }
 
 func hasJSONFlag(args []string) bool {
