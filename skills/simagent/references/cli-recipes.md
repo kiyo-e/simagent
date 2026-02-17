@@ -35,8 +35,9 @@ Tap:
 Type:
 
 ```bash
-./simagent ui type "hello@example.com" --into --index 2 --json
-./simagent ui type "123456" --into --id otp_field --json
+./simagent ui type --text "hello@example.com" --into --index 2 --replace --json
+./simagent ui type --text "123456" --into --id otp_field --replace --ascii --json
+./simagent ui type --text "090-0000-0000" --into --label "電話番号" --replace --ascii --json
 ./simagent ui type "plain text input" --json
 ```
 

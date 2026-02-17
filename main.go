@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"image"
 	"image/color"
 	"image/draw"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type GlobalOptions struct {
@@ -115,6 +117,7 @@ type Element struct {
 	Value       string        `json:"value,omitempty"`
 	NearbyLabel string        `json:"nearbyLabel,omitempty"`
 	Enabled     bool          `json:"enabled"`
+	Focused     bool          `json:"focused,omitempty"`
 	Visible     bool          `json:"visible"`
 	Offscreen   bool          `json:"offscreen"`
 	Frame       FrameRect     `json:"frame"`
@@ -166,12 +169,56 @@ type frameOptions struct {
 	UI              bool
 	Annotate        bool
 	InteractiveOnly bool
+	Stable          bool
+	StableSamples   int
+	StableInterval  time.Duration
 	Order           string
 	Format          string
 	MinArea         float64
 	IncludeRoles    map[string]bool
 	ExcludeRoles    map[string]bool
 	EmitJSON        bool
+}
+
+type uiFlowFile struct {
+	Name  string       `json:"name,omitempty"`
+	Steps []uiFlowStep `json:"steps"`
+}
+
+type uiFlowStep struct {
+	Name           string          `json:"name,omitempty"`
+	Action         string          `json:"action"`
+	Selectors      uiFlowSelectors `json:"selectors,omitempty"`
+	Text           string          `json:"text,omitempty"`
+	Into           *bool           `json:"into,omitempty"`
+	Verify         bool            `json:"verify,omitempty"`
+	Replace        bool            `json:"replace,omitempty"`
+	ASCII          bool            `json:"ascii,omitempty"`
+	Paste          bool            `json:"paste,omitempty"`
+	Direction      string          `json:"direction,omitempty"`
+	Distance       float64         `json:"distance,omitempty"`
+	Unit           string          `json:"unit,omitempty"`
+	X              *float64        `json:"x,omitempty"`
+	Y              *float64        `json:"y,omitempty"`
+	HasText        string          `json:"hasText,omitempty"`
+	InteractiveMin *int            `json:"interactiveMin,omitempty"`
+	Timeout        string          `json:"timeout,omitempty"`
+	Interval       string          `json:"interval,omitempty"`
+	Wait           uiFlowWait      `json:"wait,omitempty"`
+}
+
+type uiFlowSelectors struct {
+	Index    *int   `json:"index,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Label    string `json:"label,omitempty"`
+	Contains string `json:"contains,omitempty"`
+}
+
+type uiFlowWait struct {
+	HasText        string `json:"hasText,omitempty"`
+	InteractiveMin *int   `json:"interactiveMin,omitempty"`
+	Timeout        string `json:"timeout,omitempty"`
+	Interval       string `json:"interval,omitempty"`
 }
 
 var interactiveRoleHints = []string{
@@ -181,6 +228,11 @@ var interactiveRoleHints = []string{
 var textInputRoleHints = []string{
 	"textfield", "securetextfield", "searchfield", "textarea", "textview",
 }
+
+const (
+	backspaceKeyCode = "42"
+	defaultClearKeys = 72
+)
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -370,6 +422,9 @@ func (a *App) cmdFrame(args []string) (bool, error) {
 	fs.BoolVar(&opts.UI, "ui", true, "capture ui tree")
 	fs.BoolVar(&opts.Annotate, "annotate", true, "annotate screenshot")
 	fs.BoolVar(&opts.InteractiveOnly, "interactive-only", true, "keep interactive elements only")
+	fs.BoolVar(&opts.Stable, "stable", false, "require stable ui tree before accepting frame")
+	fs.IntVar(&opts.StableSamples, "stable-samples", 3, "number of ui samples for stability check")
+	fs.DurationVar(&opts.StableInterval, "stable-interval", 250*time.Millisecond, "interval between stable ui samples")
 	fs.StringVar(&opts.Order, "order", "reading", "reading|z|stable")
 	fs.StringVar(&opts.Format, "format", "png", "png|jpg")
 	fs.Float64Var(&opts.MinArea, "min-area", 0, "minimum area in pt^2")
@@ -390,6 +445,15 @@ func (a *App) cmdFrame(args []string) (bool, error) {
 	}
 	if opts.Format != "png" && opts.Format != "jpg" {
 		return opts.EmitJSON, &AppError{Code: "USAGE", Message: "--format must be png|jpg"}
+	}
+	if opts.Stable && !opts.UI {
+		return opts.EmitJSON, &AppError{Code: "USAGE", Message: "--stable requires --ui"}
+	}
+	if opts.StableSamples < 2 {
+		return opts.EmitJSON, &AppError{Code: "USAGE", Message: "--stable-samples must be >= 2"}
+	}
+	if opts.StableInterval < 0 {
+		return opts.EmitJSON, &AppError{Code: "USAGE", Message: "--stable-interval must be >= 0"}
 	}
 
 	target, err := a.resolveTarget(a.opts.Target)
@@ -432,24 +496,42 @@ func (a *App) cmdFrame(args []string) (bool, error) {
 		if _, lookErr := exec.LookPath("idb"); lookErr != nil {
 			return opts.EmitJSON, &AppError{Code: "IDB_NOT_FOUND", Message: "idb is not installed or not in PATH"}
 		}
-		cmd, runErr := a.runIDB(target.UDID, "ui", "describe-all", "--json")
-		if runErr != nil {
-			a.logf("idb ui describe-all failed: %v", runErr)
-			rawUI = map[string]any{"error": renderError(runErr)}
+		if opts.Stable {
+			samples, stableErr := a.captureStableUISamples(target.UDID, opts)
+			if stableErr != nil {
+				return opts.EmitJSON, stableErr
+			}
+			lastSample := samples[len(samples)-1]
+			rawUI = lastSample.Raw
+			allElements = lastSample.Elements
+			allCount = lastSample.AllCount
+			interactiveCount = lastSample.InteractiveCount
+			for i, sample := range samples {
+				samplePath := filepath.Join(opts.OutDir, fmt.Sprintf("ui.sample-%02d.raw.json", i+1))
+				if writeErr := writeJSONFile(samplePath, sample.Raw); writeErr == nil {
+					artifacts[fmt.Sprintf("uiSample%02d", i+1)] = samplePath
+				}
+			}
 			if writeErr := writeJSONFile(uiRawPath, rawUI); writeErr != nil {
 				return opts.EmitJSON, writeErr
 			}
 		} else {
-			parsed, parseErr := decodeJSONOrWrap(cmd.Stdout)
-			if parseErr != nil {
-				rawUI = map[string]any{"raw": cmd.Stdout}
+			sample, sampleErr := a.captureUISample(target.UDID, opts)
+			if sampleErr != nil {
+				a.logf("idb ui describe-all failed: %v", sampleErr)
+				rawUI = map[string]any{"error": renderError(sampleErr)}
+				if writeErr := writeJSONFile(uiRawPath, rawUI); writeErr != nil {
+					return opts.EmitJSON, writeErr
+				}
 			} else {
-				rawUI = parsed
+				rawUI = sample.Raw
+				allElements = sample.Elements
+				allCount = sample.AllCount
+				interactiveCount = sample.InteractiveCount
+				if writeErr := writeJSONFile(uiRawPath, rawUI); writeErr != nil {
+					return opts.EmitJSON, writeErr
+				}
 			}
-			if writeErr := writeJSONFile(uiRawPath, rawUI); writeErr != nil {
-				return opts.EmitJSON, writeErr
-			}
-			allElements, allCount, interactiveCount = normalizeElements(rawUI, opts)
 		}
 		artifacts["uiRaw"] = uiRawPath
 		result.Artifacts.UIRaw = filepath.Base(uiRawPath)
@@ -513,7 +595,7 @@ func (a *App) cmdFrame(args []string) (bool, error) {
 
 func (a *App) cmdUI(args []string) (bool, error) {
 	if len(args) == 0 {
-		return a.opts.JSON, &AppError{Code: "USAGE", Message: "ui subcommand required: tap|type|swipe|wait|button"}
+		return a.opts.JSON, &AppError{Code: "USAGE", Message: "ui subcommand required: tap|type|clear|swipe|wait|button|flow"}
 	}
 	sub := args[0]
 	args = args[1:]
@@ -591,6 +673,14 @@ func (a *App) cmdUI(args []string) (bool, error) {
 					elem, err = pickElementBySelectors(snapshot.Elements, *index, *id, usedLabel, usedContains)
 					if err == nil {
 						by = "live-scan"
+					}
+					if err != nil && (usedLabel != "" || usedContains != "") {
+						if fallback, ok := pickIntentFallbackElement(snapshot.Elements, usedLabel, usedContains); ok {
+							elem = fallback
+							err = nil
+							by = "intent-fallback"
+							fallbackUsed = true
+						}
 					}
 					if err != nil && (usedLabel != "" || usedContains != "") {
 						if fallback, ok := pickSystemFallbackElement(snapshot.Elements, usedLabel, usedContains); ok {
@@ -686,7 +776,13 @@ func (a *App) cmdUI(args []string) (bool, error) {
 		emitJSON = emitJSON || opts.JSON
 		text := strings.TrimSpace(opts.Text)
 		if text == "" {
-			return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui type --text \"...\" [--into --index <n>|--id <id>|--label <text>|--contains <text>] [--verify]"}
+			return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui type --text \"...\" [--into --index <n>|--id <id>|--label <text>|--contains <text>] [--replace] [--ascii|--paste] [--verify]"}
+		}
+		if opts.Replace && !opts.Into {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--replace requires --into"}
+		}
+		if opts.Paste && opts.LegacyTypeParsing {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--paste is not supported with --legacy-type-parsing"}
 		}
 
 		selectorCount := countElementSelectors(opts.Index, opts.ID, opts.Label, opts.Contains)
@@ -697,45 +793,50 @@ func (a *App) cmdUI(args []string) (bool, error) {
 			return emitJSON, &AppError{Code: "USAGE", Message: "selector flags require --into"}
 		}
 
+		prepared, inputMode, err := prepareTypedText(text, opts.ASCII, opts.Paste)
+		if err != nil {
+			return emitJSON, err
+		}
+
 		var focused *Element
 		if opts.Into {
-			elements := []Element{}
-			if strings.TrimSpace(opts.From) != "" || opts.Index >= 0 || strings.TrimSpace(opts.ID) != "" {
-				loadedElements, _, loadErr := loadElementsAndTransform(opts.From)
-				if loadErr != nil {
-					return emitJSON, loadErr
-				}
-				elements = loadedElements
-			} else if loadedElements, _, loadErr := loadElementsAndTransform(opts.From); loadErr == nil {
-				elements = loadedElements
+			elem, resolveErr := a.resolveElementForInput(target.UDID, opts.From, opts.Index, opts.ID, opts.Label, opts.Contains)
+			if resolveErr != nil {
+				return emitJSON, resolveErr
 			}
-			elem, err := pickElementBySelectors(elements, opts.Index, opts.ID, opts.Label, opts.Contains)
-			if err != nil {
-				snapshot, snapErr := a.captureElements(target.UDID)
-				if snapErr != nil {
-					return emitJSON, err
+			focusedElem, focusErr := a.focusElementWithRetry(target.UDID, elem, opts.FocusRetries)
+			if focusErr != nil {
+				return emitJSON, focusErr
+			}
+			focused = &focusedElem
+			if opts.Replace {
+				clearPoint := clearPointForElement(focusedElem)
+				if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(clearPoint.X), idbCoordArg(clearPoint.Y)); err != nil {
+					return emitJSON, wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed before replace")
 				}
-				elem, err = pickElementBySelectors(snapshot.Elements, opts.Index, opts.ID, opts.Label, opts.Contains)
-				if err != nil {
-					return emitJSON, err
+				estimate := estimateClearBackspaces(focusedElem)
+				if clearErr := a.clearFocusedInput(target.UDID, estimate); clearErr != nil {
+					return emitJSON, clearErr
 				}
 			}
-			focusPoint := focusPointForElement(elem)
-			if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(focusPoint.X), idbCoordArg(focusPoint.Y)); err != nil {
-				return emitJSON, wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed")
-			}
-			copyElem := elem
-			copyElem.Center = focusPoint
-			focused = &copyElem
 		}
 
-		if _, err := a.runIDB(target.UDID, "ui", "text", text); err != nil {
-			return emitJSON, wrapAppErrCode(err, "IDB_UI_FAILED", "text input failed")
+		if err := a.submitTextInput(target.UDID, prepared, opts.Paste, focused); err != nil {
+			return emitJSON, err
 		}
 
-		resp := map[string]any{"ok": true, "action": "type", "text": text}
+		resp := map[string]any{"ok": true, "action": "type", "text": prepared, "inputMode": inputMode}
+		if opts.ASCII {
+			resp["ascii"] = true
+		}
+		if opts.Paste {
+			resp["paste"] = true
+		}
+		if opts.Replace {
+			resp["replace"] = true
+		}
 		if opts.Verify {
-			verify, err := a.verifyTypeResult(target.UDID, text, focused)
+			verify, err := a.verifyTypeResult(target.UDID, prepared, focused)
 			if err != nil {
 				return emitJSON, err
 			}
@@ -745,9 +846,74 @@ func (a *App) cmdUI(args []string) (bool, error) {
 		if emitJSON {
 			a.printJSON(resp)
 		} else {
-			fmt.Printf("typed: %s\n", text)
+			fmt.Printf("typed: %s\n", prepared)
 		}
 		return emitJSON, nil
+
+	case "clear":
+		fs := flag.NewFlagSet("ui clear", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		index := fs.Int("index", -1, "element index")
+		id := fs.String("id", "", "element id")
+		label := fs.String("label", "", "clear by exact label")
+		contains := fs.String("contains", "", "clear by partial label/value")
+		from := fs.String("from", "", "path to elements.json")
+		backspaces := fs.Int("max-backspaces", defaultClearKeys, "maximum backspaces to send")
+		localJSON := fs.Bool("json", false, "")
+		if err := fs.Parse(args); err != nil {
+			return emitJSON, &AppError{Code: "USAGE", Message: err.Error()}
+		}
+		emitJSON = emitJSON || *localJSON
+		if fs.NArg() != 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "ui clear does not accept positional args"}
+		}
+		if *backspaces <= 0 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "--max-backspaces must be > 0"}
+		}
+		if countElementSelectors(*index, *id, *label, *contains) != 1 {
+			return emitJSON, &AppError{Code: "USAGE", Message: "ui clear requires exactly one selector: --index|--id|--label|--contains"}
+		}
+
+		elem, err := a.resolveElementForInput(target.UDID, *from, *index, *id, *label, *contains)
+		if err != nil {
+			return emitJSON, err
+		}
+		if _, err := a.focusElementWithRetry(target.UDID, elem, 2); err != nil {
+			return emitJSON, err
+		}
+		clearPoint := clearPointForElement(elem)
+		if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(clearPoint.X), idbCoordArg(clearPoint.Y)); err != nil {
+			return emitJSON, wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed before clear")
+		}
+		estimate := *backspaces
+		auto := estimateClearBackspaces(elem)
+		if auto > estimate {
+			estimate = auto
+		}
+		if err := a.clearFocusedInput(target.UDID, estimate); err != nil {
+			return emitJSON, err
+		}
+
+		resp := map[string]any{
+			"ok":         true,
+			"action":     "clear",
+			"backspaces": estimate,
+			"selector": map[string]any{
+				"index":    *index,
+				"id":       strings.TrimSpace(*id),
+				"label":    strings.TrimSpace(*label),
+				"contains": strings.TrimSpace(*contains),
+			},
+		}
+		if emitJSON {
+			a.printJSON(resp)
+		} else {
+			fmt.Printf("cleared (%d backspaces)\n", estimate)
+		}
+		return emitJSON, nil
+
+	case "flow":
+		return a.cmdUIFlow(target, args, emitJSON)
 
 	case "wait":
 		fs := flag.NewFlagSet("ui wait", flag.ContinueOnError)
@@ -774,64 +940,16 @@ func (a *App) cmdUI(args []string) (bool, error) {
 			return emitJSON, &AppError{Code: "USAGE", Message: "--interval must be > 0"}
 		}
 
-		started := time.Now()
-		attempts := 0
-		lastInteractive := 0
-		lastMatches := []string{}
-		var lastErr error
-		targetText := strings.ToLower(strings.TrimSpace(*hasText))
-
-		for {
-			attempts++
-			snapshot, snapErr := a.captureElements(target.UDID)
-			if snapErr != nil {
-				lastErr = snapErr
-			} else {
-				lastErr = nil
-				lastInteractive = snapshot.InteractiveCount
-				textMatches := matchingTextSamples(snapshot.Elements, targetText)
-				lastMatches = textMatches
-				interactiveOK := *interactiveMin < 0 || snapshot.InteractiveCount >= *interactiveMin
-				textOK := targetText == "" || len(textMatches) > 0
-				if interactiveOK && textOK {
-					resp := map[string]any{
-						"ok":          true,
-						"action":      "wait",
-						"attempts":    attempts,
-						"elapsedMs":   time.Since(started).Milliseconds(),
-						"interactive": snapshot.InteractiveCount,
-					}
-					if targetText != "" {
-						resp["hasText"] = *hasText
-						resp["matches"] = textMatches
-					}
-					if emitJSON {
-						a.printJSON(resp)
-					} else {
-						fmt.Printf("wait ok (%d attempts)\n", attempts)
-					}
-					return emitJSON, nil
-				}
-			}
-
-			if time.Since(started) >= *timeout {
-				details := map[string]any{
-					"attempts":       attempts,
-					"elapsedMs":      time.Since(started).Milliseconds(),
-					"interactive":    lastInteractive,
-					"interactiveMin": *interactiveMin,
-				}
-				if targetText != "" {
-					details["hasText"] = *hasText
-					details["lastMatches"] = lastMatches
-				}
-				if lastErr != nil {
-					details["lastError"] = renderError(lastErr)
-				}
-				return emitJSON, &AppError{Code: "WAIT_TIMEOUT", Message: "wait condition not met before timeout", Details: details}
-			}
-			time.Sleep(*interval)
+		waitResp, err := a.waitForCondition(target.UDID, strings.TrimSpace(*hasText), *interactiveMin, *timeout, *interval)
+		if err != nil {
+			return emitJSON, err
 		}
+		if emitJSON {
+			a.printJSON(waitResp)
+		} else {
+			fmt.Printf("wait ok (%v attempts)\n", waitResp["attempts"])
+		}
+		return emitJSON, nil
 
 	case "swipe":
 		fs := flag.NewFlagSet("ui swipe", flag.ContinueOnError)
@@ -936,6 +1054,777 @@ func (a *App) cmdUI(args []string) (bool, error) {
 
 	default:
 		return emitJSON, &AppError{Code: "USAGE", Message: "unknown ui subcommand: " + sub}
+	}
+}
+
+type frameUISample struct {
+	Raw              any
+	Elements         []Element
+	AllCount         int
+	InteractiveCount int
+	Hash             string
+}
+
+func (a *App) captureUISample(udid string, opts frameOptions) (frameUISample, error) {
+	cmd, runErr := a.runIDB(udid, "ui", "describe-all", "--json")
+	if runErr != nil {
+		return frameUISample{}, wrapAppErrCode(runErr, "IDB_UI_FAILED", "failed to capture ui tree")
+	}
+	parsed, parseErr := decodeJSONOrWrap(cmd.Stdout)
+	if parseErr != nil {
+		parsed = map[string]any{"raw": cmd.Stdout}
+	}
+	elements, allCount, interactiveCount := normalizeElements(parsed, opts)
+	return frameUISample{
+		Raw:              parsed,
+		Elements:         elements,
+		AllCount:         allCount,
+		InteractiveCount: interactiveCount,
+		Hash:             hashElementSet(elements),
+	}, nil
+}
+
+func (a *App) captureStableUISamples(udid string, opts frameOptions) ([]frameUISample, error) {
+	samples := make([]frameUISample, 0, opts.StableSamples)
+	hashes := make([]string, 0, opts.StableSamples)
+	for i := 0; i < opts.StableSamples; i++ {
+		sample, err := a.captureUISample(udid, opts)
+		if err != nil {
+			return nil, err
+		}
+		samples = append(samples, sample)
+		hashes = append(hashes, sample.Hash)
+		if i+1 < opts.StableSamples && opts.StableInterval > 0 {
+			time.Sleep(opts.StableInterval)
+		}
+	}
+	if !allStringsEqual(hashes) {
+		return nil, &AppError{
+			Code:    "FRAME_UNSTABLE",
+			Message: "ui tree changed during stable sampling",
+			Details: map[string]any{
+				"hashes":   hashes,
+				"samples":  opts.StableSamples,
+				"interval": opts.StableInterval.String(),
+			},
+		}
+	}
+	return samples, nil
+}
+
+func hashElementSet(elements []Element) string {
+	h := fnv.New64a()
+	for _, elem := range elements {
+		_, _ = fmt.Fprintf(h, "%s|%s|%s|%s|%.1f|%.1f|%.1f|%.1f|%t|%t|%t\n",
+			elem.ID,
+			strings.ToLower(strings.TrimSpace(elem.Role)),
+			strings.TrimSpace(elem.Label),
+			strings.TrimSpace(elem.Value),
+			elem.Frame.X,
+			elem.Frame.Y,
+			elem.Frame.W,
+			elem.Frame.H,
+			elem.Enabled,
+			elem.Visible,
+			elem.Offscreen,
+		)
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+func allStringsEqual(values []string) bool {
+	if len(values) <= 1 {
+		return true
+	}
+	base := values[0]
+	for _, v := range values[1:] {
+		if v != base {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) cmdUIFlow(target SimTarget, args []string, emitJSON bool) (bool, error) {
+	if len(args) == 0 {
+		return emitJSON, &AppError{Code: "USAGE", Message: "usage: simagent ui flow run --file <path> [--resume-from <step>]"}
+	}
+	sub := args[0]
+	if sub != "run" {
+		return emitJSON, &AppError{Code: "USAGE", Message: "unknown ui flow subcommand: " + sub}
+	}
+
+	fs := flag.NewFlagSet("ui flow run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	file := fs.String("file", "", "path to flow json")
+	resumeFrom := fs.Int("resume-from", 1, "1-based step index to resume from")
+	localJSON := fs.Bool("json", false, "")
+	if err := fs.Parse(args[1:]); err != nil {
+		return emitJSON, &AppError{Code: "USAGE", Message: err.Error()}
+	}
+	emitJSON = emitJSON || *localJSON
+	if strings.TrimSpace(*file) == "" {
+		return emitJSON, &AppError{Code: "USAGE", Message: "--file is required"}
+	}
+	if *resumeFrom <= 0 {
+		return emitJSON, &AppError{Code: "USAGE", Message: "--resume-from must be >= 1"}
+	}
+	if fs.NArg() != 0 {
+		return emitJSON, &AppError{Code: "USAGE", Message: "ui flow run does not accept positional args"}
+	}
+
+	b, err := os.ReadFile(*file)
+	if err != nil {
+		return emitJSON, wrapErr("IO_ERROR", "failed to read flow file", err)
+	}
+	var flow uiFlowFile
+	if err := json.Unmarshal(b, &flow); err != nil {
+		return emitJSON, wrapErr("IO_ERROR", "failed to parse flow file json", err)
+	}
+	if len(flow.Steps) == 0 {
+		return emitJSON, &AppError{Code: "USAGE", Message: "flow file must include at least one step"}
+	}
+	if *resumeFrom > len(flow.Steps) {
+		return emitJSON, &AppError{Code: "USAGE", Message: "--resume-from exceeds number of steps"}
+	}
+
+	results := make([]map[string]any, 0, len(flow.Steps)-(*resumeFrom-1))
+	for i := *resumeFrom - 1; i < len(flow.Steps); i++ {
+		step := flow.Steps[i]
+		stepResult, stepErr := a.executeFlowStep(target, step)
+		if stepErr != nil {
+			outDir := filepath.Join(os.TempDir(), "simagent", fmt.Sprintf("flow-failure-%s-step-%02d", time.Now().Format("2006-01-02T15-04-05"), i+1))
+			artifacts := a.captureFailureArtifacts(target.UDID, outDir)
+			return emitJSON, &AppError{
+				Code:    "FLOW_STEP_FAILED",
+				Message: fmt.Sprintf("flow step %d failed", i+1),
+				Details: map[string]any{
+					"step":       i + 1,
+					"name":       strings.TrimSpace(step.Name),
+					"action":     strings.TrimSpace(step.Action),
+					"resumeFrom": i + 1,
+					"error":      renderError(stepErr),
+					"artifacts":  artifacts,
+				},
+			}
+		}
+		stepResult["step"] = i + 1
+		stepResult["name"] = strings.TrimSpace(step.Name)
+		results = append(results, stepResult)
+	}
+
+	resp := map[string]any{
+		"ok":         true,
+		"action":     "flow-run",
+		"name":       flow.Name,
+		"file":       *file,
+		"resumeFrom": *resumeFrom,
+		"steps":      results,
+	}
+	if emitJSON {
+		a.printJSON(resp)
+	} else {
+		fmt.Printf("flow completed: %d steps\n", len(results))
+	}
+	return emitJSON, nil
+}
+
+func (a *App) executeFlowStep(target SimTarget, step uiFlowStep) (map[string]any, error) {
+	action := strings.ToLower(strings.TrimSpace(step.Action))
+	switch action {
+	case "tap":
+		if step.X != nil && step.Y != nil {
+			if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(*step.X), idbCoordArg(*step.Y)); err != nil {
+				return nil, wrapAppErrCode(err, "IDB_UI_FAILED", "tap failed")
+			}
+			return map[string]any{"action": "tap", "by": "coord", "targetPt": map[string]any{"x": *step.X, "y": *step.Y}}, nil
+		}
+		index, id, label, contains := selectorsFromFlowStep(step)
+		if countElementSelectors(index, id, label, contains) != 1 {
+			return nil, &AppError{Code: "USAGE", Message: "flow tap requires x/y or exactly one selector"}
+		}
+		elem, err := a.resolveElementForInput(target.UDID, "", index, id, label, contains)
+		if err != nil {
+			return nil, err
+		}
+		tapPoint := elem.Center
+		if isTextInputRole(elem.Role) {
+			tapPoint = focusPointForElement(elem)
+		}
+		if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(tapPoint.X), idbCoordArg(tapPoint.Y)); err != nil {
+			return nil, wrapAppErrCode(err, "IDB_UI_FAILED", "tap failed")
+		}
+		return map[string]any{
+			"action":   "tap",
+			"by":       "selector",
+			"selector": map[string]any{"index": index, "id": id, "label": label, "contains": contains},
+			"targetPt": map[string]any{"x": tapPoint.X, "y": tapPoint.Y},
+		}, nil
+	case "type":
+		text := strings.TrimSpace(step.Text)
+		if text == "" {
+			return nil, &AppError{Code: "USAGE", Message: "flow type requires text"}
+		}
+		index, id, label, contains := selectorsFromFlowStep(step)
+		into := step.Into != nil && *step.Into
+		if step.Into == nil && countElementSelectors(index, id, label, contains) == 1 {
+			into = true
+		}
+		if into && countElementSelectors(index, id, label, contains) != 1 {
+			return nil, &AppError{Code: "USAGE", Message: "flow type --into requires exactly one selector"}
+		}
+
+		prepared, inputMode, err := prepareTypedText(text, step.ASCII, step.Paste)
+		if err != nil {
+			return nil, err
+		}
+
+		var focused *Element
+		if into {
+			elem, err := a.resolveElementForInput(target.UDID, "", index, id, label, contains)
+			if err != nil {
+				return nil, err
+			}
+			focusedElem, err := a.focusElementWithRetry(target.UDID, elem, 2)
+			if err != nil {
+				return nil, err
+			}
+			focused = &focusedElem
+			if step.Replace {
+				clearPoint := clearPointForElement(focusedElem)
+				if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(clearPoint.X), idbCoordArg(clearPoint.Y)); err != nil {
+					return nil, wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed before replace")
+				}
+				if err := a.clearFocusedInput(target.UDID, estimateClearBackspaces(focusedElem)); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := a.submitTextInput(target.UDID, prepared, step.Paste, focused); err != nil {
+			return nil, err
+		}
+		result := map[string]any{"action": "type", "text": prepared, "inputMode": inputMode}
+		if step.Verify {
+			verify, err := a.verifyTypeResult(target.UDID, prepared, focused)
+			if err != nil {
+				return nil, err
+			}
+			result["verify"] = verify
+		}
+		return result, nil
+	case "clear":
+		index, id, label, contains := selectorsFromFlowStep(step)
+		if countElementSelectors(index, id, label, contains) != 1 {
+			return nil, &AppError{Code: "USAGE", Message: "flow clear requires exactly one selector"}
+		}
+		elem, err := a.resolveElementForInput(target.UDID, "", index, id, label, contains)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := a.focusElementWithRetry(target.UDID, elem, 2); err != nil {
+			return nil, err
+		}
+		clearPoint := clearPointForElement(elem)
+		if _, err := a.runIDB(target.UDID, "ui", "tap", idbCoordArg(clearPoint.X), idbCoordArg(clearPoint.Y)); err != nil {
+			return nil, wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed before clear")
+		}
+		count := estimateClearBackspaces(elem)
+		if err := a.clearFocusedInput(target.UDID, count); err != nil {
+			return nil, err
+		}
+		return map[string]any{"action": "clear", "backspaces": count}, nil
+	case "swipe":
+		direction := strings.ToLower(strings.TrimSpace(step.Direction))
+		if direction == "" {
+			direction = "up"
+		}
+		if direction != "up" && direction != "down" && direction != "left" && direction != "right" {
+			return nil, &AppError{Code: "USAGE", Message: "flow swipe direction must be up|down|left|right"}
+		}
+		distance := step.Distance
+		if distance <= 0 {
+			distance = 220
+		}
+		startX := 196.0
+		startY := 426.0
+		index, id, _, _ := selectorsFromFlowStep(step)
+		if countElementSelectors(index, id, "", "") == 1 {
+			elem, err := a.resolveElementForInput(target.UDID, "", index, id, "", "")
+			if err != nil {
+				return nil, err
+			}
+			startX = elem.Center.X
+			startY = elem.Center.Y
+		}
+		endX := startX
+		endY := startY
+		switch direction {
+		case "up":
+			endY -= distance
+		case "down":
+			endY += distance
+		case "left":
+			endX -= distance
+		case "right":
+			endX += distance
+		}
+		if _, err := a.runIDB(target.UDID, "ui", "swipe", idbCoordArg(startX), idbCoordArg(startY), idbCoordArg(endX), idbCoordArg(endY)); err != nil {
+			return nil, wrapAppErrCode(err, "IDB_UI_FAILED", "swipe failed")
+		}
+		return map[string]any{"action": "swipe", "direction": direction}, nil
+	case "wait":
+		hasText := strings.TrimSpace(step.HasText)
+		interactiveMin := -1
+		if step.InteractiveMin != nil {
+			interactiveMin = *step.InteractiveMin
+		}
+		timeoutRaw := strings.TrimSpace(step.Timeout)
+		intervalRaw := strings.TrimSpace(step.Interval)
+		if strings.TrimSpace(step.Wait.HasText) != "" {
+			hasText = strings.TrimSpace(step.Wait.HasText)
+		}
+		if step.Wait.InteractiveMin != nil {
+			interactiveMin = *step.Wait.InteractiveMin
+		}
+		if strings.TrimSpace(step.Wait.Timeout) != "" {
+			timeoutRaw = strings.TrimSpace(step.Wait.Timeout)
+		}
+		if strings.TrimSpace(step.Wait.Interval) != "" {
+			intervalRaw = strings.TrimSpace(step.Wait.Interval)
+		}
+		timeout := 20 * time.Second
+		interval := 700 * time.Millisecond
+		var err error
+		if timeoutRaw != "" {
+			timeout, err = time.ParseDuration(timeoutRaw)
+			if err != nil {
+				return nil, &AppError{Code: "USAGE", Message: "invalid flow wait timeout: " + timeoutRaw}
+			}
+		}
+		if intervalRaw != "" {
+			interval, err = time.ParseDuration(intervalRaw)
+			if err != nil {
+				return nil, &AppError{Code: "USAGE", Message: "invalid flow wait interval: " + intervalRaw}
+			}
+		}
+		return a.waitForCondition(target.UDID, hasText, interactiveMin, timeout, interval)
+	default:
+		return nil, &AppError{Code: "USAGE", Message: "unsupported flow action: " + action}
+	}
+}
+
+func selectorsFromFlowStep(step uiFlowStep) (int, string, string, string) {
+	index := -1
+	if step.Selectors.Index != nil {
+		index = *step.Selectors.Index
+	}
+	return index, strings.TrimSpace(step.Selectors.ID), strings.TrimSpace(step.Selectors.Label), strings.TrimSpace(step.Selectors.Contains)
+}
+
+func (a *App) captureFailureArtifacts(udid, outDir string) map[string]any {
+	out := map[string]any{"outDir": outDir}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		out["error"] = err.Error()
+		return out
+	}
+	screenshotPath := filepath.Join(outDir, "screen.png")
+	if _, err := a.runSimctl("io", udid, "screenshot", screenshotPath); err == nil {
+		out["screenshot"] = screenshotPath
+	}
+	cmd, err := a.runIDB(udid, "ui", "describe-all", "--json")
+	if err == nil {
+		rawPath := filepath.Join(outDir, "ui.raw.json")
+		if parsed, parseErr := decodeJSONOrWrap(cmd.Stdout); parseErr == nil {
+			_ = writeJSONFile(rawPath, parsed)
+			out["uiRaw"] = rawPath
+		}
+	}
+	return out
+}
+
+func (a *App) resolveElementForInput(udid, from string, index int, id, label, contains string) (Element, error) {
+	elements := []Element{}
+	if strings.TrimSpace(from) != "" || index >= 0 || strings.TrimSpace(id) != "" {
+		loadedElements, _, loadErr := loadElementsAndTransform(from)
+		if loadErr != nil {
+			return Element{}, loadErr
+		}
+		elements = loadedElements
+	} else if loadedElements, _, loadErr := loadElementsAndTransform(from); loadErr == nil {
+		elements = loadedElements
+	}
+	elem, err := pickElementBySelectors(elements, index, id, label, contains)
+	if err == nil {
+		return elem, nil
+	}
+
+	snapshot, snapErr := a.captureElements(udid)
+	if snapErr != nil {
+		return Element{}, err
+	}
+	elem, err = pickElementBySelectors(snapshot.Elements, index, id, label, contains)
+	if err == nil {
+		return elem, nil
+	}
+	if fallback, ok := pickIntentFallbackElement(snapshot.Elements, label, contains); ok {
+		return fallback, nil
+	}
+	if fallback, ok := pickSystemFallbackElement(snapshot.Elements, label, contains); ok {
+		return fallback, nil
+	}
+	return Element{}, err
+}
+
+func (a *App) focusElementWithRetry(udid string, elem Element, retries int) (Element, error) {
+	if retries <= 0 {
+		retries = 1
+	}
+	target := elem
+	focusPoint := focusPointForElement(target)
+	var lastReason string
+	var lastSnapshot *elementSnapshot
+	var lastErr error
+
+	for attempt := 1; attempt <= retries; attempt++ {
+		if _, err := a.runIDB(udid, "ui", "tap", idbCoordArg(focusPoint.X), idbCoordArg(focusPoint.Y)); err != nil {
+			lastErr = wrapAppErrCode(err, "IDB_UI_FAILED", "focus tap failed")
+			continue
+		}
+		time.Sleep(120 * time.Millisecond)
+		snapshot, err := a.captureElements(udid)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		lastSnapshot = &snapshot
+		matched, ok := findBestVerificationTarget(snapshot.Elements, target)
+		if !ok {
+			lastReason = "target element not found after tap"
+			continue
+		}
+		target = matched
+		focusPoint = focusPointForElement(target)
+		if canTrustFocus(snapshot.Elements, matched) {
+			target.Center = focusPoint
+			return target, nil
+		}
+		lastReason = "focus moved to different element"
+	}
+
+	details := map[string]any{
+		"selectorId": strings.TrimSpace(elem.ID),
+		"attempts":   retries,
+	}
+	if strings.TrimSpace(lastReason) != "" {
+		details["reason"] = lastReason
+	}
+	if lastErr != nil {
+		details["lastError"] = renderError(lastErr)
+	}
+	if lastSnapshot != nil {
+		details["interactive"] = lastSnapshot.InteractiveCount
+	}
+	return Element{}, &AppError{Code: "TYPE_FOCUS_FAILED", Message: "failed to verify focus target after retries", Details: details}
+}
+
+func canTrustFocus(elements []Element, target Element) bool {
+	hasFocused := false
+	for _, elem := range elements {
+		if !elem.Focused {
+			continue
+		}
+		hasFocused = true
+		if strings.TrimSpace(target.ID) == "" {
+			dx := elem.Center.X - target.Center.X
+			dy := elem.Center.Y - target.Center.Y
+			if math.Hypot(dx, dy) <= 24 {
+				return true
+			}
+		}
+		if elem.ID == target.ID {
+			return true
+		}
+	}
+	return !hasFocused
+}
+
+func estimateClearBackspaces(elem Element) int {
+	runes := len([]rune(strings.TrimSpace(elem.Value)))
+	switch {
+	case runes <= 0:
+		return defaultClearKeys
+	case runes < 16:
+		return 24
+	case runes < 40:
+		return runes + 12
+	default:
+		return minInt(runes+16, 220)
+	}
+}
+
+func (a *App) clearFocusedInput(udid string, count int) error {
+	if count <= 0 {
+		count = defaultClearKeys
+	}
+	args := make([]string, 0, count+2)
+	args = append(args, "ui", "key-sequence")
+	for i := 0; i < count; i++ {
+		args = append(args, backspaceKeyCode)
+	}
+	if _, err := a.runIDB(udid, args...); err == nil {
+		return nil
+	}
+	for i := 0; i < count; i++ {
+		if _, err := a.runIDB(udid, "ui", "key", backspaceKeyCode); err != nil {
+			return wrapAppErrCode(err, "IDB_UI_FAILED", "clear text failed")
+		}
+	}
+	return nil
+}
+
+func prepareTypedText(text string, asciiMode, pasteMode bool) (string, string, error) {
+	out := strings.TrimSpace(text)
+	if asciiMode {
+		out = asciiOnly(out)
+		if strings.TrimSpace(out) == "" {
+			return "", "", &AppError{Code: "TYPE_ASCII_EMPTY", Message: "text became empty after ASCII normalization"}
+		}
+	}
+	mode := "type"
+	if pasteMode && asciiMode {
+		mode = "paste-ascii"
+	} else if pasteMode {
+		mode = "paste"
+	} else if asciiMode {
+		mode = "ascii"
+	}
+	return out, mode, nil
+}
+
+func asciiOnly(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 32 && r <= 126 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (a *App) submitTextInput(udid, text string, pasteMode bool, focused *Element) error {
+	_ = pasteMode
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	if err := a.typeTextInChunks(udid, text, 4); err != nil {
+		return err
+	}
+
+	target := focused
+	if target == nil {
+		if snapshot, err := a.captureElements(udid); err == nil {
+			if focusedElem, ok := findFocusedTextInput(snapshot.Elements); ok {
+				target = &focusedElem
+			}
+		}
+	}
+	if target == nil || isSecureTextInputRole(target.Role) {
+		return nil
+	}
+
+	lastObserved := ""
+	for attempt := 1; attempt <= 4; attempt++ {
+		time.Sleep(90 * time.Millisecond)
+		snapshot, err := a.captureElements(udid)
+		if err != nil {
+			return err
+		}
+		matched, ok := findBestVerificationTarget(snapshot.Elements, *target)
+		if !ok {
+			if focusedElem, hasFocus := findFocusedTextInput(snapshot.Elements); hasFocus {
+				matched = focusedElem
+				ok = true
+			}
+		}
+		if !ok {
+			return &AppError{
+				Code:    "TYPE_VERIFY_FAILED",
+				Message: "typed text verification target not found",
+				Details: map[string]any{"intended": text, "attempt": attempt},
+			}
+		}
+		target = &matched
+		if isSecureTextInputRole(matched.Role) {
+			return nil
+		}
+		observed := strings.TrimSpace(matched.Value)
+		if observed == "" {
+			observed = strings.TrimSpace(matched.Label)
+		}
+		lastObserved = observed
+		missing, comparable := typedMissingSuffix(text, observed)
+		if !comparable {
+			return &AppError{
+				Code:    "TYPE_INCOMPLETE",
+				Message: "typed text does not match target value prefix",
+				Details: map[string]any{"intended": text, "observed": observed, "attempt": attempt, "elementId": matched.ID},
+			}
+		}
+		if missing == "" {
+			return nil
+		}
+		if err := a.typeTextInChunks(udid, missing, 4); err != nil {
+			return err
+		}
+	}
+
+	if missing, _ := typedMissingSuffix(text, lastObserved); missing != "" {
+		return &AppError{
+			Code:    "TYPE_INCOMPLETE",
+			Message: "typed text remains incomplete after retries",
+			Details: map[string]any{"intended": text, "observed": lastObserved, "missing": missing},
+		}
+	}
+	return nil
+}
+
+func (a *App) typeTextInChunks(udid, text string, chunkRunes int) error {
+	chunks := splitIntoInputChunks(text, chunkRunes)
+	for _, chunk := range chunks {
+		if chunk == "" {
+			continue
+		}
+		if _, err := a.runIDB(udid, "ui", "text", chunk); err != nil {
+			return wrapAppErrCode(err, "IDB_UI_FAILED", "text input failed")
+		}
+		if len(chunks) > 1 {
+			time.Sleep(60 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+func splitIntoInputChunks(text string, chunkRunes int) []string {
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return nil
+	}
+	if chunkRunes <= 0 || len(runes) <= chunkRunes {
+		return []string{text}
+	}
+	chunks := make([]string, 0, (len(runes)+chunkRunes-1)/chunkRunes)
+	for i := 0; i < len(runes); i += chunkRunes {
+		end := i + chunkRunes
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[i:end]))
+	}
+	return chunks
+}
+
+func findFocusedTextInput(elements []Element) (Element, bool) {
+	for _, elem := range elements {
+		if elem.Enabled && elem.Focused && isTextInputRole(elem.Role) {
+			return elem, true
+		}
+	}
+	return Element{}, false
+}
+
+func typedMissingSuffix(intended, observed string) (string, bool) {
+	intendedRunes := []rune(intended)
+	observedRunes := []rune(observed)
+	intendedComparable, intendedMap := comparableRunesWithMap(intendedRunes)
+	observedComparable, _ := comparableRunesWithMap(observedRunes)
+	if len(observedComparable) > len(intendedComparable) {
+		return "", false
+	}
+	for i := 0; i < len(observedComparable); i++ {
+		if observedComparable[i] != intendedComparable[i] {
+			return "", false
+		}
+	}
+	if len(observedComparable) == len(intendedComparable) {
+		return "", true
+	}
+	start := intendedMap[len(observedComparable)]
+	if start < 0 || start > len(intendedRunes) {
+		return "", false
+	}
+	return string(intendedRunes[start:]), true
+}
+
+func comparableRunesWithMap(runes []rune) ([]rune, []int) {
+	comparable := make([]rune, 0, len(runes))
+	indexMap := make([]int, 0, len(runes))
+	for i, r := range runes {
+		if isIgnoredCompareRune(r) {
+			continue
+		}
+		comparable = append(comparable, r)
+		indexMap = append(indexMap, i)
+	}
+	return comparable, indexMap
+}
+
+func isIgnoredCompareRune(r rune) bool {
+	return unicode.IsSpace(r)
+}
+
+func (a *App) waitForCondition(udid, hasText string, interactiveMin int, timeout, interval time.Duration) (map[string]any, error) {
+	started := time.Now()
+	attempts := 0
+	lastInteractive := 0
+	lastMatches := []string{}
+	var lastErr error
+	targetText := strings.ToLower(strings.TrimSpace(hasText))
+
+	for {
+		attempts++
+		snapshot, snapErr := a.captureElements(udid)
+		if snapErr != nil {
+			lastErr = snapErr
+		} else {
+			lastErr = nil
+			lastInteractive = snapshot.InteractiveCount
+			textMatches := matchingTextSamples(snapshot.Elements, targetText)
+			lastMatches = textMatches
+			interactiveOK := interactiveMin < 0 || snapshot.InteractiveCount >= interactiveMin
+			textOK := targetText == "" || len(textMatches) > 0
+			if interactiveOK && textOK {
+				resp := map[string]any{
+					"ok":          true,
+					"action":      "wait",
+					"attempts":    attempts,
+					"elapsedMs":   time.Since(started).Milliseconds(),
+					"interactive": snapshot.InteractiveCount,
+				}
+				if targetText != "" {
+					resp["hasText"] = hasText
+					resp["matches"] = textMatches
+				}
+				return resp, nil
+			}
+		}
+
+		if time.Since(started) >= timeout {
+			details := map[string]any{
+				"attempts":       attempts,
+				"elapsedMs":      time.Since(started).Milliseconds(),
+				"interactive":    lastInteractive,
+				"interactiveMin": interactiveMin,
+			}
+			if targetText != "" {
+				details["hasText"] = hasText
+				details["lastMatches"] = lastMatches
+			}
+			if lastErr != nil {
+				details["lastError"] = renderError(lastErr)
+			}
+			return nil, &AppError{Code: "WAIT_TIMEOUT", Message: "wait condition not met before timeout", Details: details}
+		}
+		time.Sleep(interval)
 	}
 }
 
@@ -1301,6 +2190,7 @@ func elementFromCandidate(node candidateNode) (Element, bool) {
 		label = value
 	}
 	enabled := firstBoolWithDefault(node.Map, []string{"enabled", "isEnabled"}, true)
+	focused := firstBoolWithDefault(node.Map, []string{"focused", "isFocused", "hasFocus", "AXFocused"}, false)
 
 	return Element{
 		ID:      id,
@@ -1308,6 +2198,7 @@ func elementFromCandidate(node candidateNode) (Element, bool) {
 		Label:   label,
 		Value:   value,
 		Enabled: enabled,
+		Focused: focused,
 		Visible: true,
 		Frame:   rect,
 		Center:  FramePoint{X: rect.X + rect.W/2, Y: rect.Y + rect.H/2, Unit: "pt"},
@@ -1888,6 +2779,10 @@ type uiTypeOptions struct {
 	Label             string
 	Contains          string
 	From              string
+	Replace           bool
+	ASCII             bool
+	Paste             bool
+	FocusRetries      int
 	Verify            bool
 	JSON              bool
 	LegacyTypeParsing bool
@@ -2048,6 +2943,76 @@ func pickSystemFallbackElement(elements []Element, label, contains string) (Elem
 	return best, found
 }
 
+func pickIntentFallbackElement(elements []Element, label, contains string) (Element, bool) {
+	query := strings.ToLower(strings.TrimSpace(label))
+	if query == "" {
+		query = strings.ToLower(strings.TrimSpace(contains))
+	}
+	if query == "" {
+		return Element{}, false
+	}
+
+	wantBack := containsAnyToken(query, []string{"back", "戻る", "キャンセル", "close", "dismiss"})
+	wantCheck := containsAnyToken(query, []string{"check", "checkbox", "同意", "規約", "debug", "デバッグ", "確認"})
+	if !wantBack && !wantCheck {
+		return Element{}, false
+	}
+
+	type candidate struct {
+		Element Element
+		Score   int
+	}
+	candidates := make([]candidate, 0)
+	for _, elem := range elements {
+		if !elem.Enabled || !elem.Visible {
+			continue
+		}
+		if !isInteractiveRole(elem.Role) {
+			continue
+		}
+		score := 0
+		text := strings.ToLower(elementText(elem))
+		if strings.Contains(text, query) {
+			score += 60
+		}
+		if wantBack {
+			if elem.Center.Y <= 180 {
+				score += 25
+			}
+			if elem.Center.X <= 120 {
+				score += 20
+			}
+		}
+		if wantCheck {
+			if strings.Contains(strings.ToLower(elem.Role), "switch") {
+				score += 45
+			}
+			if elem.Frame.W <= 64 && elem.Frame.H <= 64 {
+				score += 22
+			}
+			if containsAnyToken(strings.ToLower(elem.NearbyLabel), []string{"同意", "規約", "確認", "debug", "デバッグ"}) {
+				score += 28
+			}
+		}
+		if strings.TrimSpace(elem.Label) == "" {
+			score += 10
+		}
+		if score > 0 {
+			candidates = append(candidates, candidate{Element: elem, Score: score})
+		}
+	}
+	if len(candidates) == 0 {
+		return Element{}, false
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Score != candidates[j].Score {
+			return candidates[i].Score > candidates[j].Score
+		}
+		return candidates[i].Element.Index < candidates[j].Element.Index
+	})
+	return candidates[0].Element, true
+}
+
 func containsAnyToken(s string, tokens []string) bool {
 	for _, token := range tokens {
 		if strings.Contains(s, token) {
@@ -2058,7 +3023,7 @@ func containsAnyToken(s string, tokens []string) bool {
 }
 
 func parseUITypeArgs(args []string) (uiTypeOptions, error) {
-	opts := uiTypeOptions{Index: -1}
+	opts := uiTypeOptions{Index: -1, FocusRetries: 2}
 	positionals := make([]string, 0)
 
 	nextValue := func(i *int, name string) (string, error) {
@@ -2074,12 +3039,35 @@ func parseUITypeArgs(args []string) (uiTypeOptions, error) {
 		switch {
 		case arg == "--into":
 			opts.Into = true
+		case arg == "--replace":
+			opts.Replace = true
+		case arg == "--ascii":
+			opts.ASCII = true
+		case arg == "--paste":
+			opts.Paste = true
 		case arg == "--verify":
 			opts.Verify = true
 		case arg == "--json":
 			opts.JSON = true
 		case arg == "--legacy-type-parsing":
 			opts.LegacyTypeParsing = true
+		case arg == "--focus-retries":
+			raw, err := nextValue(&i, "--focus-retries")
+			if err != nil {
+				return opts, err
+			}
+			parsed, convErr := strconv.Atoi(strings.TrimSpace(raw))
+			if convErr != nil {
+				return opts, &AppError{Code: "USAGE", Message: "--focus-retries must be an integer"}
+			}
+			opts.FocusRetries = parsed
+		case strings.HasPrefix(arg, "--focus-retries="):
+			raw := strings.TrimSpace(strings.TrimPrefix(arg, "--focus-retries="))
+			parsed, convErr := strconv.Atoi(raw)
+			if convErr != nil {
+				return opts, &AppError{Code: "USAGE", Message: "--focus-retries must be an integer"}
+			}
+			opts.FocusRetries = parsed
 		case arg == "--index":
 			raw, err := nextValue(&i, "--index")
 			if err != nil {
@@ -2148,6 +3136,9 @@ func parseUITypeArgs(args []string) (uiTypeOptions, error) {
 	opts.Label = strings.TrimSpace(opts.Label)
 	opts.Contains = strings.TrimSpace(opts.Contains)
 	opts.Text = strings.TrimSpace(opts.Text)
+	if opts.FocusRetries <= 0 {
+		return opts, &AppError{Code: "USAGE", Message: "--focus-retries must be >= 1"}
+	}
 	if opts.Text != "" && len(positionals) > 0 {
 		return opts, &AppError{Code: "USAGE", Message: "use either --text or positional text, not both"}
 	}
@@ -2168,6 +3159,22 @@ func focusPointForElement(elem Element) FramePoint {
 	x := elem.Frame.X + inset
 	maxX := elem.Frame.X + elem.Frame.W - 8
 	if x > maxX {
+		x = elem.Center.X
+	}
+	return FramePoint{X: x, Y: elem.Center.Y, Unit: "pt"}
+}
+
+func clearPointForElement(elem Element) FramePoint {
+	if !isTextInputRole(elem.Role) {
+		return elem.Center
+	}
+	if elem.Frame.W <= 0 {
+		return elem.Center
+	}
+	inset := math.Max(8, math.Min(elem.Frame.W*0.15, 24))
+	x := elem.Frame.X + elem.Frame.W - inset
+	minX := elem.Frame.X + 6
+	if x < minX {
 		x = elem.Center.X
 	}
 	return FramePoint{X: x, Y: elem.Center.Y, Unit: "pt"}
@@ -2535,6 +3542,13 @@ func renderError(err error) map[string]any {
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

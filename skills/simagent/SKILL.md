@@ -29,6 +29,8 @@ Use this skill to run `simagent` quickly and deterministically during iOS Simula
 - Use index or ID when available (`--index`, `--id`) to avoid coordinate drift.
 - Use coordinate tap only when no reliable element metadata exists.
 - For pixel coordinates, supply `--unit px` and ensure `transform.json` is resolvable from last frame or `--from`.
+- For text input, prefer `ui type --into --index|--id|--label --replace --ascii`.
+- If input must be exact (phone/OTP/postal), verify value from a fresh frame after typing.
 
 5. Re-capture and continue loop.
 - After each meaningful UI action, call `frame` again.
@@ -38,7 +40,7 @@ Use this skill to run `simagent` quickly and deterministically during iOS Simula
 
 - Use `target` for listing/selecting simulator devices and persisted default target.
 - Use `frame` for screenshot + UI tree normalization + annotation artifacts.
-- Use `ui` for interaction (`tap`, `type`, `swipe`, `button`).
+- Use `ui` for interaction (`tap`, `type`, `clear`, `swipe`, `wait`, `button`, `flow run`).
 - Use `app` for simulator-level app actions (`openurl`, `launch`, `terminate`, `list`).
 - Use `raw` only for passthrough commands that are not covered by higher-level commands.
 
@@ -54,6 +56,7 @@ Use this skill to run `simagent` quickly and deterministically during iOS Simula
 - Prefer `--json` whenever the response will be parsed or chained.
 - Avoid stale indexes: never assume an index from an older frame remains valid.
 - Choose one interaction mode per command: index, ID, or explicit coordinates.
+- For unstable text fields, do not use bare `ui type` first; use `--into` so partial-input recovery can target the focused field.
 - Pass `--args` marker for `app launch` runtime args, for example `app launch --bundle-id com.example --args --foo bar`.
 - Keep failure handling strict: surface command error code/message, then perform the smallest corrective retry.
 

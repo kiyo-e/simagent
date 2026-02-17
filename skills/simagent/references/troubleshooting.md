@@ -26,6 +26,14 @@
   - Cause: `--index` or `--id` does not exist in current `elements.json`.
   - Action: re-run `frame`, inspect latest elements, and retry with valid selector.
 
+- `TYPE_FOCUS_FAILED`
+  - Cause: `ui type --into ...` could not verify target focus after retries.
+  - Action: run `frame`, confirm selector, then retry with explicit selector (`--index` or `--id`) and `--focus-retries`.
+
+- `TYPE_INCOMPLETE`
+  - Cause: underlying `idb ui text` dropped part of the input and auto-completion could not fully recover.
+  - Action: prefer `ui type --into <selector> --replace --ascii`, then verify with a fresh `frame`.
+
 - `COORD_TRANSFORM_FAILED`
   - Cause: pixel-to-point conversion requested with invalid/missing transform scale.
   - Action: refresh frame and ensure matching `transform.json` is available.

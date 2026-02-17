@@ -16,8 +16,9 @@ It is designed for fast `frame -> action -> frame` loops during live debugging s
   - normalized elements with stable indexes (`label/value/visible/offscreen/nearbyLabel` included)
   - transform metadata (`pt <-> px`)
   - annotated screenshot with index overlays
+  - optional stability sampling via `--stable`
 - UI actions by coordinates, index, element ID, or text:
-  - tap / type / swipe / wait / button
+  - tap / type / clear / swipe / wait / button / flow run
 - App helper actions:
   - openurl / launch / terminate / list
 - Machine-readable JSON output (`--json`)
@@ -74,7 +75,7 @@ git push origin v0.1.0
 3. Type into a target field:
 
 ```bash
-./simagent ui type --text "hello@example.com" --into --index 2 --verify --json
+./simagent ui type --text "hello@example.com" --into --index 2 --replace --verify --json
 ```
 
 4. Wait for a UI transition:
@@ -86,7 +87,7 @@ git push origin v0.1.0
 5. Re-capture frame:
 
 ```bash
-./simagent frame --json
+./simagent frame --stable --json
 ```
 
 ## Command Overview
@@ -102,7 +103,7 @@ Top-level commands:
 
 - `target` (`list`, `set`, `show`)
 - `frame`
-- `ui` (`tap`, `type`, `swipe`, `wait`, `button`)
+- `ui` (`tap`, `type`, `clear`, `swipe`, `wait`, `button`, `flow run`)
 - `app` (`openurl`, `launch`, `terminate`, `list`)
 - `raw` (`simctl`, `idb`)
 
@@ -135,9 +136,18 @@ Generated files:
 ## UI Command Notes
 
 `ui type` now supports `--text` as the primary input. Positional text is still accepted for compatibility.
+When `--into`/focused fields are available, simagent retries partial `idb ui text` inputs and appends missing suffixes automatically.
+For fragile numeric fields (phone, zip, OTP), prefer `--into` with selector + `--replace --ascii`.
 
 ```bash
-./simagent ui type --text "170" --into --label "身長" --verify --json
+./simagent ui type --text "170" --into --label "身長" --replace --ascii --verify --json
+./simagent ui type --text "090-0000-0000" --into --label "電話番号" --replace --ascii --json
+```
+
+`ui clear` clears a focused input field by selector:
+
+```bash
+./simagent ui clear --label "郵便番号" --json
 ```
 
 `ui tap` supports text-based selectors and falls back to system-UI heuristics for common top-bar actions (for example add/cancel style buttons):
@@ -151,6 +161,12 @@ Generated files:
 
 ```bash
 ./simagent ui wait --has-text "送信完了" --interactive-min 1 --timeout 20s --interval 700ms --json
+```
+
+`ui flow run` executes JSON-defined `tap/type/swipe/wait` steps:
+
+```bash
+./simagent ui flow run --file ./fixtures/flows/signup-minimal.json --json
 ```
 
 ## JSON Error Shape
