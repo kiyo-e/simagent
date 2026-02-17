@@ -1221,11 +1221,26 @@ func createAnnotatedImage(srcPath, dstPath string, elements []Element, transform
 		if r.Dx() <= 1 || r.Dy() <= 1 {
 			continue
 		}
-		strokeRect(rgba, r, color.RGBA{R: 255, G: 64, B: 64, A: 255}, 3)
+
+		stroke := annotationStrokeColor(e.Index)
+		strokeThickness := maxInt(3, int(math.Round(scale*1.5)))
+		strokeRect(rgba, r, stroke, strokeThickness)
+
 		label := strconv.Itoa(e.Index)
-		labelRect := image.Rect(r.Min.X, maxInt(0, r.Min.Y-16), r.Min.X+8+len(label)*8, maxInt(0, r.Min.Y-16)+14)
-		fillRect(rgba, labelRect, color.RGBA{R: 0, G: 0, B: 0, A: 190})
-		drawDigits(rgba, labelRect.Min.X+3, labelRect.Min.Y+2, label, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+		digitScale := maxInt(4, int(math.Round(scale*2)))
+		digitWidth := 8 * digitScale
+		digitHeight := 8 * digitScale
+		labelPaddingX := maxInt(4, digitScale)
+		labelPaddingY := maxInt(3, digitScale/2)
+		labelW := labelPaddingX*2 + len(label)*digitWidth
+		labelH := labelPaddingY*2 + digitHeight
+		labelTop := maxInt(0, r.Min.Y-labelH-2)
+		labelRect := image.Rect(r.Min.X, labelTop, r.Min.X+labelW, labelTop+labelH)
+		labelRect = clampRectToBounds(labelRect, rgba.Bounds())
+		labelBG := color.RGBA{R: stroke.R, G: stroke.G, B: stroke.B, A: 220}
+		fillRect(rgba, labelRect, labelBG)
+		strokeRect(rgba, labelRect, color.RGBA{R: 255, G: 255, B: 255, A: 230}, maxInt(1, digitScale/4))
+		drawDigits(rgba, labelRect.Min.X+labelPaddingX, labelRect.Min.Y+labelPaddingY, label, annotationTextColor(stroke), digitScale)
 	}
 
 	f, err := os.Create(dstPath)
@@ -1267,17 +1282,48 @@ func fillRect(img draw.Image, r image.Rectangle, c color.Color) {
 	draw.Draw(img, r, &image.Uniform{C: c}, image.Point{}, draw.Src)
 }
 
-func drawDigits(img *image.RGBA, x int, y int, text string, c color.Color) {
+func clampRectToBounds(r image.Rectangle, bounds image.Rectangle) image.Rectangle {
+	if r.Dx() >= bounds.Dx() {
+		r.Min.X = bounds.Min.X
+		r.Max.X = bounds.Max.X
+	} else {
+		if r.Min.X < bounds.Min.X {
+			r = r.Add(image.Pt(bounds.Min.X-r.Min.X, 0))
+		}
+		if r.Max.X > bounds.Max.X {
+			r = r.Add(image.Pt(bounds.Max.X-r.Max.X, 0))
+		}
+	}
+
+	if r.Dy() >= bounds.Dy() {
+		r.Min.Y = bounds.Min.Y
+		r.Max.Y = bounds.Max.Y
+	} else {
+		if r.Min.Y < bounds.Min.Y {
+			r = r.Add(image.Pt(0, bounds.Min.Y-r.Min.Y))
+		}
+		if r.Max.Y > bounds.Max.Y {
+			r = r.Add(image.Pt(0, bounds.Max.Y-r.Max.Y))
+		}
+	}
+
+	return r
+}
+
+func drawDigits(img *image.RGBA, x int, y int, text string, c color.Color, scale int) {
+	if scale <= 0 {
+		scale = 1
+	}
 	offset := 0
 	for _, ch := range text {
 		if ch >= '0' && ch <= '9' {
-			drawDigit(img, x+offset, y, int(ch-'0'), c)
-			offset += 8
+			drawDigit(img, x+offset, y, int(ch-'0'), c, scale)
+			offset += 8 * scale
 		}
 	}
 }
 
-func drawDigit(img *image.RGBA, x int, y int, digit int, c color.Color) {
+func drawDigit(img *image.RGBA, x int, y int, digit int, c color.Color, scale int) {
 	segments := [10][7]bool{
 		{true, true, true, true, true, true, false},
 		{false, true, true, false, false, false, false},
@@ -1293,28 +1339,64 @@ func drawDigit(img *image.RGBA, x int, y int, digit int, c color.Color) {
 	if digit < 0 || digit > 9 {
 		return
 	}
+	if scale <= 0 {
+		scale = 1
+	}
+	scaleRect := func(x0 int, y0 int, x1 int, y1 int) image.Rectangle {
+		return image.Rect(x+x0*scale, y+y0*scale, x+x1*scale, y+y1*scale)
+	}
 	on := segments[digit]
 	if on[0] {
-		fillRect(img, image.Rect(x+1, y, x+6, y+1), c)
+		fillRect(img, scaleRect(1, 0, 6, 1), c)
 	}
 	if on[1] {
-		fillRect(img, image.Rect(x+6, y+1, x+7, y+4), c)
+		fillRect(img, scaleRect(6, 1, 7, 4), c)
 	}
 	if on[2] {
-		fillRect(img, image.Rect(x+6, y+4, x+7, y+7), c)
+		fillRect(img, scaleRect(6, 4, 7, 7), c)
 	}
 	if on[3] {
-		fillRect(img, image.Rect(x+1, y+7, x+6, y+8), c)
+		fillRect(img, scaleRect(1, 7, 6, 8), c)
 	}
 	if on[4] {
-		fillRect(img, image.Rect(x, y+4, x+1, y+7), c)
+		fillRect(img, scaleRect(0, 4, 1, 7), c)
 	}
 	if on[5] {
-		fillRect(img, image.Rect(x, y+1, x+1, y+4), c)
+		fillRect(img, scaleRect(0, 1, 1, 4), c)
 	}
 	if on[6] {
-		fillRect(img, image.Rect(x+1, y+3, x+6, y+4), c)
+		fillRect(img, scaleRect(1, 3, 6, 4), c)
 	}
+}
+
+func annotationStrokeColor(index int) color.RGBA {
+	palette := []color.RGBA{
+		{R: 220, G: 53, B: 69, A: 255},
+		{R: 13, G: 110, B: 253, A: 255},
+		{R: 25, G: 135, B: 84, A: 255},
+		{R: 255, G: 140, B: 0, A: 255},
+		{R: 111, G: 66, B: 193, A: 255},
+		{R: 32, G: 201, B: 151, A: 255},
+		{R: 214, G: 51, B: 132, A: 255},
+		{R: 13, G: 202, B: 240, A: 255},
+		{R: 102, G: 16, B: 242, A: 255},
+		{R: 108, G: 117, B: 125, A: 255},
+	}
+	if len(palette) == 0 {
+		return color.RGBA{R: 255, G: 64, B: 64, A: 255}
+	}
+	if index < 0 {
+		index = -index
+	}
+	return palette[index%len(palette)]
+}
+
+func annotationTextColor(bg color.RGBA) color.RGBA {
+	brightness := int(bg.R)*299 + int(bg.G)*587 + int(bg.B)*114
+	if brightness >= 140000 {
+		return color.RGBA{R: 0, G: 0, B: 0, A: 255}
+	}
+	return color.RGBA{R: 255, G: 255, B: 255, A: 255}
 }
 
 func imageSize(path string) (image.Point, error) {

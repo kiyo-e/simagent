@@ -1,0 +1,4 @@
+interface:
+  display_name: "SimAgent iOS Simulator"
+  short_description: "Automate iOS Simulator via simagent CLI"
+  default_prompt: "Use $simagent to run frame-action loops on iOS Simulator with structured JSON outputs."

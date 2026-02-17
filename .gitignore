@@ -1,7 +1,7 @@
 .DS_Store
 
 # Build artifacts
-simagent
+/simagent
 *.exe
 *.out
 *.test
