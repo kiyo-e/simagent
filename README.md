@@ -39,6 +39,24 @@ cd simagent
 go build -o simagent .
 ```
 
+## Build and Distribute with GitHub Actions
+
+Workflow file: `.github/workflows/build-and-release.yml`
+
+- On pull requests and pushes to `main`, it runs `go test ./...` and builds:
+  - `simagent_darwin_arm64.tar.gz`
+  - `simagent_darwin_amd64.tar.gz`
+- On tags matching `v*` (example: `v0.1.0`), it publishes a GitHub Release with:
+  - both macOS archives
+  - `checksums.txt`
+
+Release trigger example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Quick Start
 
 1. Capture frame:
